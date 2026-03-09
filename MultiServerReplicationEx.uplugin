@@ -1,0 +1,32 @@
+{
+	"FileVersion": 3,
+	"FriendlyName": "Multi-server Replication Ex",
+	"Version": 1,
+	"VersionName": "1.0",
+	"Description": "Extended fork of MultiServerReplication with dynamic proxy support and integrated DSTM transport for seamless cross-server player migration via beacon mesh.",
+	"Category": "Networking",
+	"CreatedBy": "jota2rz (forked from Epic Games, Inc.)",
+	"CreatedByURL": "https://github.com/jota2rz/MultiServerReplicationEx",
+	"EnabledByDefault": false,
+	"CanContainContent": false,
+	"IsExperimentalVersion": true,
+	"Installed": false,
+	"Modules": [
+		{
+			"Name": "MultiServerReplicationEx",
+			"Type": "Runtime",
+			"LoadingPhase": "Default"
+		},
+		{
+			"Name": "MultiServerConfigurationEx",
+			"Type": "Runtime",
+			"LoadingPhase": "Default"
+		}
+	],
+	"Plugins": [
+		{
+			"Name": "OnlineSubsystemUtils",
+			"Enabled": true
+		}
+	]
+}

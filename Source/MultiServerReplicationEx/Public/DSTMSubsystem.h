@@ -48,7 +48,7 @@ class ADSTMBeaconClient;
  *   4. On shutdown, mesh is torn down gracefully
  */
 UCLASS()
-class DSTMTRANSPORT_API UDSTMSubsystem : public UGameInstanceSubsystem
+class MULTISERVERREPLICATIONEX_API UDSTMSubsystem : public UGameInstanceSubsystem
 {
 	GENERATED_BODY()
 

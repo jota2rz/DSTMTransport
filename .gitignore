@@ -1,0 +1,8 @@
+Intermediate/
+Binaries/
+Saved/
+DerivedDataCache/
+*.sln
+*.vcxproj
+*.vcxproj.filters
+*.vcxproj.user

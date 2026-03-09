@@ -2,8 +2,7 @@
 
 #pragma once
 
-#include "CoreMinimal.h"
-#include "Modules/ModuleManager.h"
+#include "Modules/ModuleInterface.h"
 
 #if UE_WITH_REMOTE_OBJECT_HANDLE
 #include "UObject/RemoteObjectTransfer.h"
@@ -11,28 +10,35 @@
 #endif
 
 /**
- * Module for the DSTM Transport plugin.
+ * Module for Multi-server Replication Ex.
+ *
+ * Extends the stock MultiServerReplication plugin with DSTM transport support.
  *
  * Responsibilities:
  *   1. Initialize FRemoteServerId for this server instance (from -DedicatedServerId=)
  *   2. Pre-bind the DSTM transport delegates BEFORE InitRemoteObjects() runs,
- *      routing serialized migration data through our beacon mesh instead of disk I/O.
+ *      routing serialized migration data through the beacon mesh instead of disk I/O.
  *
  * Timing:
  *   StartupModule() runs during module load, before any UWorld is created.
  *   InitRemoteObjects() runs during world initialization.
  *   → Our delegate bindings win over the default disk-based fallbacks
  *     (RemoteObject.cpp checks !IsBound() before applying defaults).
- *
- * See README.md § Architecture and § Initialization.
  */
-class FDSTMTransportModule : public IModuleInterface
+class FMultiServerReplicationExModule : public IModuleInterface
 {
 public:
+
+	FMultiServerReplicationExModule() {}
+	virtual ~FMultiServerReplicationExModule() {}
+
+	// IModuleInterface
 	virtual void StartupModule() override;
 	virtual void ShutdownModule() override;
+	virtual bool SupportsDynamicReloading() override { return false; }
+	virtual bool SupportsAutomaticShutdown() override { return false; }
 
-	static FDSTMTransportModule& Get();
+	static FMultiServerReplicationExModule& Get();
 
 private:
 	/** Parse -DedicatedServerId= and call FRemoteServerId::InitGlobalServerId(). */
@@ -64,3 +70,5 @@ private:
 	/** Whether we successfully initialized the server identity. */
 	bool bServerIdentityInitialized = false;
 };
+
+

@@ -1,10 +1,11 @@
 // Copyright Epic Games, Inc. All Rights Reserved.
 
-#include "DSTMTransportModule.h"
+#include "MultiServerReplicationModule.h"
 #include "DSTMSubsystem.h"
 #include "Engine/Engine.h"
 #include "Misc/CommandLine.h"
 #include "Misc/Parse.h"
+#include "Modules/ModuleManager.h"
 
 #if UE_WITH_REMOTE_OBJECT_HANDLE
 #include "UObject/RemoteObjectTransfer.h"
@@ -15,17 +16,17 @@ DEFINE_LOG_CATEGORY_STATIC(LogDSTM, Log, All);
 
 // ─── Module Interface ─────────────────────────────────────────────
 
-void FDSTMTransportModule::StartupModule()
+void FMultiServerReplicationExModule::StartupModule()
 {
-	UE_LOG(LogDSTM, Log, TEXT("DSTMTransport: StartupModule"));
+	UE_LOG(LogDSTM, Log, TEXT("MultiServerReplicationEx: StartupModule"));
 
 	InitializeServerIdentity();
 	BindTransportDelegates();
 }
 
-void FDSTMTransportModule::ShutdownModule()
+void FMultiServerReplicationExModule::ShutdownModule()
 {
-	UE_LOG(LogDSTM, Log, TEXT("DSTMTransport: ShutdownModule"));
+	UE_LOG(LogDSTM, Log, TEXT("MultiServerReplicationEx: ShutdownModule"));
 
 #if UE_WITH_REMOTE_OBJECT_HANDLE
 	if (bServerIdentityInitialized)
@@ -33,26 +34,26 @@ void FDSTMTransportModule::ShutdownModule()
 		UE::RemoteObject::Transfer::RemoteObjectTransferDelegate.Unbind();
 		UE::RemoteObject::Transfer::RequestRemoteObjectDelegate.Unbind();
 
-		UE_LOG(LogDSTM, Log, TEXT("DSTMTransport: Transport delegates unbound."));
+		UE_LOG(LogDSTM, Log, TEXT("MultiServerReplicationEx: Transport delegates unbound."));
 	}
 #endif
 }
 
-FDSTMTransportModule& FDSTMTransportModule::Get()
+FMultiServerReplicationExModule& FMultiServerReplicationExModule::Get()
 {
-	return FModuleManager::GetModuleChecked<FDSTMTransportModule>(TEXT("DSTMTransport"));
+	return FModuleManager::GetModuleChecked<FMultiServerReplicationExModule>(TEXT("MultiServerReplicationEx"));
 }
 
 // ─── Server Identity ──────────────────────────────────────────────
 
-void FDSTMTransportModule::InitializeServerIdentity()
+void FMultiServerReplicationExModule::InitializeServerIdentity()
 {
 #if UE_WITH_REMOTE_OBJECT_HANDLE
 	// Parse the server ID from command line: -DedicatedServerId=server-1
 	FString ServerIdStr;
 	if (!FParse::Value(FCommandLine::Get(), TEXT("-DedicatedServerId="), ServerIdStr, /*bShouldStopOnSeparator=*/false))
 	{
-		UE_LOG(LogDSTM, Log, TEXT("DSTMTransport: No -DedicatedServerId= on command line. "
+		UE_LOG(LogDSTM, Log, TEXT("MultiServerReplicationEx: No -DedicatedServerId= on command line. "
 			"Server identity not initialized (OK for clients/editor)."));
 		return;
 	}
@@ -73,24 +74,24 @@ void FDSTMTransportModule::InitializeServerIdentity()
 	bServerIdentityInitialized = true;
 
 	UE_LOG(LogDSTM, Log,
-		TEXT("DSTMTransport: Server identity initialized — DedicatedServerId='%s' → FRemoteServerId=%u (hash %u mod %u + %u)"),
+		TEXT("MultiServerReplicationEx: Server identity initialized — DedicatedServerId='%s' → FRemoteServerId=%u (hash %u mod %u + %u)"),
 		*ServerIdStr, ServerId, Hash, Range, MinId);
 #else
 	UE_LOG(LogDSTM, Warning,
-		TEXT("DSTMTransport: UE_WITH_REMOTE_OBJECT_HANDLE is disabled. "
+		TEXT("MultiServerReplicationEx: UE_WITH_REMOTE_OBJECT_HANDLE is disabled. "
 			"DSTM transport requires an engine build with this define set to 1."));
 #endif
 }
 
 // ─── Transport Delegate Binding ───────────────────────────────────
 
-void FDSTMTransportModule::BindTransportDelegates()
+void FMultiServerReplicationExModule::BindTransportDelegates()
 {
 #if UE_WITH_REMOTE_OBJECT_HANDLE
 	if (!bServerIdentityInitialized)
 	{
 		UE_LOG(LogDSTM, Log,
-			TEXT("DSTMTransport: Skipping delegate binding — server identity not initialized."));
+			TEXT("MultiServerReplicationEx: Skipping delegate binding — server identity not initialized."));
 		return;
 	}
 
@@ -99,15 +100,15 @@ void FDSTMTransportModule::BindTransportDelegates()
 	// RemoteObject.cpp:317 checks !IsBound() before applying disk defaults,
 	// so binding here (before InitRemoteObjects) ensures our transport wins.
 	UE::RemoteObject::Transfer::RemoteObjectTransferDelegate.BindStatic(
-		&FDSTMTransportModule::OnRemoteObjectTransfer);
+		&FMultiServerReplicationExModule::OnRemoteObjectTransfer);
 
 	// Bind the request delegate — called when a server needs to pull an object
 	// from a remote server (pull-migration).
 	UE::RemoteObject::Transfer::RequestRemoteObjectDelegate.BindStatic(
-		&FDSTMTransportModule::OnRequestRemoteObject);
+		&FMultiServerReplicationExModule::OnRequestRemoteObject);
 
 	UE_LOG(LogDSTM, Log,
-		TEXT("DSTMTransport: Transport delegates bound (beacon-based, replacing disk I/O)."));
+		TEXT("MultiServerReplicationEx: Transport delegates bound (beacon-based, replacing disk I/O)."));
 #endif
 }
 
@@ -153,7 +154,7 @@ static UDSTMSubsystem* FindDSTMSubsystem()
 	return nullptr;
 }
 
-void FDSTMTransportModule::OnRemoteObjectTransfer(
+void FMultiServerReplicationExModule::OnRemoteObjectTransfer(
 	const UE::RemoteObject::Transfer::FMigrateSendParams& Params)
 {
 	UDSTMSubsystem* Sub = FindDSTMSubsystem();
@@ -164,12 +165,12 @@ void FDSTMTransportModule::OnRemoteObjectTransfer(
 	else
 	{
 		UE_LOG(LogDSTM, Error,
-			TEXT("DSTMTransport: RemoteObjectTransferDelegate fired but no DSTMSubsystem found! "
+			TEXT("MultiServerReplicationEx: RemoteObjectTransferDelegate fired but no DSTMSubsystem found! "
 				"Migration data will be lost."));
 	}
 }
 
-void FDSTMTransportModule::OnRequestRemoteObject(
+void FMultiServerReplicationExModule::OnRequestRemoteObject(
 	FRemoteWorkPriority Priority,
 	FRemoteObjectId ObjectId,
 	FRemoteServerId LastKnownServerId,
@@ -183,7 +184,7 @@ void FDSTMTransportModule::OnRequestRemoteObject(
 	else
 	{
 		UE_LOG(LogDSTM, Error,
-			TEXT("DSTMTransport: RequestRemoteObjectDelegate fired but no DSTMSubsystem found!"));
+			TEXT("MultiServerReplicationEx: RequestRemoteObjectDelegate fired but no DSTMSubsystem found!"));
 	}
 }
 
@@ -191,4 +192,4 @@ void FDSTMTransportModule::OnRequestRemoteObject(
 
 // ─── Module Registration ──────────────────────────────────────────
 
-IMPLEMENT_MODULE(FDSTMTransportModule, DSTMTransport)
+IMPLEMENT_MODULE(FMultiServerReplicationExModule, MultiServerReplicationEx);

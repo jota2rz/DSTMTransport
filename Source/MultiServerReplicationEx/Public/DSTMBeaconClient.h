@@ -28,7 +28,7 @@
  * 64KB reliable RPC limit.
  */
 UCLASS(Transient, Config = Engine, NotPlaceable)
-class DSTMTRANSPORT_API ADSTMBeaconClient : public AMultiServerBeaconClient
+class MULTISERVERREPLICATIONEX_API ADSTMBeaconClient : public AMultiServerBeaconClient
 {
 	GENERATED_BODY()
 

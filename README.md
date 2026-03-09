@@ -1,14 +1,20 @@
-# DSTMTransport Plugin
+# MultiServerReplicationEx
 
-A plugin for Unreal Engine 5.7 that completes the engine's built-in DSTM (Distributed State Transfer Machine) framework for seamless cross-server actor migration. It replaces the default disk-based transport with a real-time beacon mesh, enabling servers to push serialized actors directly to each other over the network without the client disconnecting.
+Extended fork of UE 5.7's `MultiServerReplication` engine plugin with **dynamic proxy support** and integrated **DSTM transport** for seamless cross-server player migration via beacon mesh.
+
+This plugin combines two concerns into a single module:
+
+1. **Proxy fixes** — adds and removes game servers at runtime, detects game server crashes
+2. **DSTM transport** — replaces the engine's default disk-based migration transport with a real-time beacon mesh, enabling servers to push serialized actors directly to each other over the network without the client disconnecting
 
 ## Contents
 
 - [Overview](#overview)
+- [Changes from Stock MultiServerReplication](#changes-from-stock-multiserverreplication)
 - [Prerequisites](#prerequisites)
-- [Architecture](#architecture)
 - [Adding the Plugin to Your Project](#adding-the-plugin-to-your-project)
 - [Engine Build Requirement](#engine-build-requirement)
+- [Architecture](#architecture)
 - [Command-Line Arguments](#command-line-arguments)
 - [Initialization](#initialization)
 - [Migrating an Actor](#migrating-an-actor)
@@ -17,22 +23,94 @@ A plugin for Unreal Engine 5.7 that completes the engine's built-in DSTM (Distri
 - [Beacon Mesh](#beacon-mesh)
 - [GUID Seed (Not Needed with DSTM)](#guid-seed-not-needed-with-dstm)
 - [Runtime Scaling](#runtime-scaling)
+- [Dynamic Proxy](#dynamic-proxy)
 - [Logging](#logging)
 - [Troubleshooting](#troubleshooting)
+- [License](#license)
 
 ---
 
 ## Overview
 
-Unreal Engine 5.7 ships a DSTM framework (`UE::RemoteObject::Transfer`) that can serialize any actor—including its player controller, possessed pawn, and all subobjects—and reconstitute it on another server without the client noticing a disconnect. By default, the engine expects a disk- or platform-specific transport layer to move the serialized blob between servers. **DSTMTransport** provides that transport layer on top of the `MultiServerReplication` plugin's beacon mesh.
+Unreal Engine 5.7 ships a DSTM framework (`UE::RemoteObject::Transfer`) that can serialize any actor — including its player controller, possessed pawn, and all subobjects — and reconstitute it on another server without the client noticing a disconnect. By default, the engine expects a disk- or platform-specific transport layer to move the serialized blob between servers. This plugin provides that transport layer on top of the `MultiServerReplication` beacon mesh.
 
-The plugin consists of three cooperating classes:
+The plugin consists of these cooperating classes:
 
 | Class | Responsibility |
 |-------|---------------|
-| `FDSTMTransportModule` | Module startup: initializes the server's `FRemoteServerId` and pre-binds the engine transport delegates |
+| `FMultiServerReplicationExModule` | Module startup: initializes the server's `FRemoteServerId` and pre-binds the engine transport delegates |
 | `UDSTMSubsystem` | Runtime: manages the DSTM beacon mesh, routes outgoing and incoming migration data, handles pull-requests |
 | `ADSTMBeaconClient` | Network: extends `AMultiServerBeaconClient` with reliable RPCs that carry serialized `FRemoteObjectData` |
+| `UProxyNetDriver` | Proxy: routes clients to multiple game servers (extended with dynamic add/remove/crash detection) |
+
+---
+
+## Changes from Stock MultiServerReplication
+
+### Module rename
+
+All modules are renamed to avoid collision with the engine's built-in plugin:
+
+| Stock | Fork |
+|---|---|
+| `MultiServerReplication` | `MultiServerReplicationEx` |
+| `MultiServerConfiguration` | `MultiServerConfigurationEx` |
+| `MULTISERVERREPLICATION_API` | `MULTISERVERREPLICATIONEX_API` |
+| `MULTISERVERCONFIGURATION_API` | `MULTISERVERCONFIGURATIONEX_API` |
+| `/Script/MultiServerReplication.*` | `/Script/MultiServerReplicationEx.*` |
+
+### Proxy Fix 1: Route existing clients to dynamically added servers
+
+```cpp
+// UProxyNetDriver (public)
+void RegisterGameServerAndConnectClients(const FURL& GameServerURL);
+```
+
+Calls `RegisterGameServer()` then iterates all current `ClientConnections`, calling `ConnectToGameServer()` for each open proxy connection so existing players get routes to the new server immediately.
+
+`ConnectToGameServer()` on `UProxyListenerNotify` was also moved from `private` to `public` to enable this.
+
+### Proxy Fix 2: Remove a game server at runtime
+
+```cpp
+// UProxyNetDriver (public)
+void UnregisterGameServer(int32 GameServerIndex);
+```
+
+Full cleanup when removing a game server:
+- Closes all proxy routes (`UProxyRoute`) that reference the server's `ParentGameServerConnection`
+- Removes players via `RemoveLocalPlayer()`
+- Destroys the backend `UIpNetDriver` for that server
+- Removes the entry from `GameServerConnections`
+- Clamps `PrimaryGameServerForNextClient` to remain valid
+
+### Proxy Fix 3: Detect game server crashes
+
+```cpp
+// Delegate (global)
+DECLARE_MULTICAST_DELEGATE_TwoParams(FOnGameServerDisconnected, int32 /*GameServerIndex*/, const FURL& /*GameServerURL*/);
+
+// UProxyNetDriver (public)
+FOnGameServerDisconnected OnGameServerDisconnected;
+```
+
+`DetectGameServerDisconnections()` is called at the start of every `TickFlush()`. It iterates `GameServerConnections` in reverse, and when a connection reaches `USOCK_Closed`:
+1. Broadcasts `OnGameServerDisconnected` with the server index and URL
+2. Calls `UnregisterGameServer()` for full cleanup
+
+Subscribe to the delegate to react to crashes (e.g., notify an orchestrator, migrate players):
+
+```cpp
+ProxyNetDriver->OnGameServerDisconnected.AddLambda(
+    [](int32 Index, const FURL& URL)
+    {
+        UE_LOG(LogTemp, Warning, TEXT("Game server %d (%s) disconnected"), Index, *URL.ToString());
+    });
+```
+
+### Integrated DSTM transport
+
+The DSTM transport classes (`UDSTMSubsystem`, `ADSTMBeaconClient`) and the module startup code (server identity initialization, transport delegate binding) are built into the `MultiServerReplicationEx` module. No separate plugin is needed.
 
 ---
 
@@ -40,75 +118,40 @@ The plugin consists of three cooperating classes:
 
 - [Unreal Engine 5.7 Source Code ](https://www.unrealengine.com/en-US/ue-on-github)
 - `UE_WITH_REMOTE_OBJECT_HANDLE=1` defined in your server target (see [Engine Build Requirement](#engine-build-requirement))
-- `MultiServerReplication` plugin (ships with UE 5.7)
 - A dedicated-server topology where each server process has a unique string ID
-
----
-
-## Architecture
-
-```
-Server-A                              Beacon Mesh              Server-B
-────────                              ───────────              ────────
-TransferActorToServer(PC)
-  └─► TransferObjectOwnership
-        ToRemoteServer()
-            │
-            ▼
-  RemoteObjectTransferDelegate
-  (bound by DSTMTransportModule)
-            │
-            ▼
-  HandleOutgoingMigration()
-  [FMemoryWriter → TArray<u8>]
-            │
-            └──── beacon RPC ────►
-                                      ServerReceive/           Beacon receives
-                                      ClientReceive            migration data
-                                      MigratedObject()               │
-                                                                     ▼
-                                                         HandleIncomingMigrationData()
-                                                         [FMemoryReader ← TArray<u8>]
-                                                                     │
-                                                                     ▼
-                                                         OnObjectDataReceived()
-                                                         [engine DSTM receive pipeline]
-                                                                     │
-                                                                     ▼
-                                                         AActor::PostMigrate(Receive)
-                                                         APlayerController::PostMigrate(Receive)
-```
-
-The DSTM beacon mesh is a separate `UMultiServerNode` instance from any game-level multi-server mesh, keeping the transport concern isolated inside the plugin.
 
 ---
 
 ## Adding the Plugin to Your Project
 
-1. Copy the `Plugins/DSTMTransport` folder into your project's `Plugins/` directory.
+1. Add the plugin to your project's `Plugins/` directory (or as a git submodule).
 
-2. Add `DSTMTransport` to the plugins list in your `.uproject` file:
+2. Add `MultiServerReplicationEx` to the plugins list in your `.uproject` file:
 
    ```json
    {
      "Plugins": [
-       { "Name": "MultiServerReplication", "Enabled": true },
-       { "Name": "DSTMTransport", "Enabled": true }
+       { "Name": "MultiServerReplicationEx", "Enabled": true }
      ]
    }
    ```
 
-3. Add `DSTMTransport` to your game module's `PublicDependencyModuleNames` if you call subsystem methods directly, or `PrivateDependencyModuleNames` if you only call through the game instance:
+   Make sure the stock `MultiServerReplication` is **not** also enabled — the two plugins define overlapping classes.
+
+3. Add `MultiServerReplicationEx` to your game module's `PrivateDependencyModuleNames`:
 
    ```cs
    // YourGame.Build.cs
-   PrivateDependencyModuleNames.AddRange(new string[]
-   {
-       "DSTMTransport",
-   });
+   PrivateDependencyModuleNames.Add("MultiServerReplicationEx");
    ```
 
-4. Rebuild your project.
+4. Use the `Ex` module name in any `-NetDriverOverrides` or class path references:
+
+   ```
+   -NetDriverOverrides=/Script/MultiServerReplicationEx.ProxyNetDriver
+   ```
+
+5. Rebuild your project.
 
 ---
 
@@ -142,9 +185,47 @@ If your project also uses a custom client target that must interoperate with the
 
 **No engine source modifications are needed**, but you must use an engine built from source (e.g. from the [EpicGames/UnrealEngine](https://github.com/EpicGames/UnrealEngine) repository). A precompiled engine installed via the Epic Games Launcher does not support recompiling engine modules with custom defines. The define propagates through UBT to every module compiled for that target, which requires the engine source to be present.
 
-If the define is `0` (or absent), the plugin compiles but remains inert: the module logs a warning, skips delegate binding, and the subsystem reports `IsMeshActive() == false`.
+If the define is `0` (or absent), the plugin compiles but the DSTM transport remains inert: the module logs a warning, skips delegate binding, and the subsystem reports `IsMeshActive() == false`. The proxy fixes still work regardless.
 
 > **ABI note:** Setting `UE_WITH_REMOTE_OBJECT_HANDLE=1` changes `FWeakObjectPtr` layout (adds `FRemoteObjectId`, growing it from 8 to 16 bytes). All modules linked into the server binary must be compiled with the same setting. This happens automatically when using `GlobalDefinitions` in the target — UBT recompiles everything for that target configuration.
+
+---
+
+## Architecture
+
+```
+Server-A                              Beacon Mesh              Server-B
+────────                              ───────────              ────────
+TransferActorToServer(PC)
+  └─► TransferObjectOwnership
+        ToRemoteServer()
+            │
+            ▼
+  RemoteObjectTransferDelegate
+  (bound by module StartupModule)
+            │
+            ▼
+  HandleOutgoingMigration()
+  [FMemoryWriter → TArray<u8>]
+            │
+            └────── beacon RPC ──────►
+                                      ServerReceive/           Beacon receives
+                                      ClientReceive            migration data
+                                      MigratedObject()               │
+                                                                     ▼
+                                                         HandleIncomingMigrationData()
+                                                         [FMemoryReader → TArray<u8>]
+                                                                     │
+                                                                     ▼
+                                                         OnObjectDataReceived()
+                                                         [engine DSTM receive pipeline]
+                                                                     │
+                                                                     ▼
+                                                         AActor::PostMigrate(Receive)
+                                                         APlayerController::PostMigrate(Receive)
+```
+
+The DSTM beacon mesh is a separate `UMultiServerNode` instance from any game-level multi-server mesh, keeping the transport concern isolated.
 
 ---
 
@@ -169,7 +250,7 @@ A complete local launch requires three kinds of arguments per game server:
 
 1. **Engine / game** — `-server -port=<game-port>`
 2. **Engine multi-server mesh** — `-MultiServerListenPort=<port> -MultiServerPeers=<peer-mesh-addresses>`
-3. **DSTMTransport** — `-DedicatedServerId=<id> -DSTMListenPort=<port> -DSTMPeers=<peer-dstm-addresses>`
+3. **DSTM transport** — `-DedicatedServerId=<id> -DSTMListenPort=<port> -DSTMPeers=<peer-dstm-addresses>`
 
 ```
 # Server 1 (game 7777, engine mesh 15000, DSTM beacon 16000)
@@ -184,7 +265,7 @@ A complete local launch requires three kinds of arguments per game server:
 
 # Proxy (connects clients to both game servers)
 -server -port=7780
--NetDriverOverrides=/Script/MultiServerReplication.ProxyNetDriver
+-NetDriverOverrides=/Script/MultiServerReplicationEx.ProxyNetDriver
 -ProxyGameServers=127.0.0.1:7777,127.0.0.1:7778
 ```
 
@@ -195,7 +276,7 @@ A complete local launch requires three kinds of arguments per game server:
 | 16000–16001 | DSTM beacon mesh (server ↔ server beacons for migration transport) |
 | 7780 | Proxy listener (client ↔ proxy, UDP) |
 
-The proxy does **not** need DSTMTransport arguments — it forwards client traffic to game servers but does not participate in server-to-server migration.
+The proxy does **not** need DSTM arguments — it forwards client traffic to game servers but does not participate in server-to-server migration.
 
 ---
 
@@ -227,7 +308,7 @@ void AYourGameMode::StartPlay()
 }
 ```
 
-`InitializeFromCommandLine()` reads the command-line arguments described above, computes the DSTM port, and calls `InitializeDSTMMesh()` internally. It returns `true` if the mesh was created or `false` if the process is not in multi-server mode (no `-DedicatedServerId=` present).
+`InitializeFromCommandLine()` reads the command-line arguments described above and calls `InitializeDSTMMesh()` internally. It returns `true` if the mesh was created or `false` if the process is not in multi-server mode (no `-DedicatedServerId=` present).
 
 ### Explicit initialization (without command-line args)
 
@@ -254,7 +335,7 @@ if (DSTM->IsMeshActive() && DSTM->AreAllPeersConnected())
 }
 ```
 
-`IsMeshActive()` — returns `true` once `InitializeDSTMMesh()` succeeds.  
+`IsMeshActive()` — returns `true` once `InitializeDSTMMesh()` succeeds.
 `AreAllPeersConnected()` — returns `true` when every expected peer has an established beacon connection.
 
 ---
@@ -307,7 +388,7 @@ Source server calls TransferActorToServer(Actor, DestServerId)
   │    ├─ Serialize Actor + subobjects → FRemoteObjectData
   │    └─ Call RemoteObjectTransferDelegate
   │
-  └─ DSTMTransportModule::OnRemoteObjectTransfer()
+  └─ FMultiServerReplicationExModule::OnRemoteObjectTransfer()
        └─ UDSTMSubsystem::HandleOutgoingMigration()
             ├─ Serialize FRemoteObjectData → TArray<uint8> via FMemoryWriter
             ├─ Look up ADSTMBeaconClient for DestServerId
@@ -338,7 +419,7 @@ This applies identically to both data-transfer RPCs and pull-request RPCs.
 
 ## Pull Migration
 
-A "pull" migration happens when a destination server requests an object that still lives on another server—for example, when the engine's DSTM scheduler determines that an object should move before the source server has initiated it.
+A "pull" migration happens when a destination server requests an object that still lives on another server — for example, when the engine's DSTM scheduler determines that an object should move before the source server has initiated it.
 
 The engine calls `RequestRemoteObjectDelegate` on the destination server. The plugin handles this with `HandleObjectRequest()`:
 
@@ -354,7 +435,7 @@ The source server receives the request, fires `OnMigrationRequested`, and `Handl
 
 ## Beacon Mesh
 
-The plugin creates its own `UMultiServerNode` for the DSTM transport. This is separate from any game-level multi-server mesh, keeping the transport concern fully inside the plugin.
+The plugin creates its own `UMultiServerNode` for the DSTM transport. This is separate from any game-level multi-server mesh, keeping the transport concern fully isolated.
 
 The DSTM beacon listens on the port specified by `-DSTMListenPort=` (default `16000`). Peer addresses in `-DSTMPeers=` must point directly to each peer's DSTM beacon port.
 
@@ -489,24 +570,20 @@ int32 PeerCount = DSTM->GetConnectedPeerCount();
 TArray<FString> PeerIds = DSTM->GetConnectedPeerIds();
 ```
 
-### MultiServer Proxy limitations
+---
 
-The MultiServer Proxy (`UProxyNetDriver`) is **partially dynamic**. Its game server list is typically parsed from `-ProxyGameServers=` during `InitBase()`, but `RegisterGameServer()` is a public method that can be called at any time after initialization to add new game servers.
+## Dynamic Proxy
 
-**What works without engine changes:**
+The MultiServer Proxy (`UProxyNetDriver`) is **fully dynamic** in this fork. Its game server list is typically parsed from `-ProxyGameServers=` during `InitBase()`, but servers can be added and removed at runtime.
+
+### What works
 
 - `RegisterGameServer(const FURL&)` can be called post-init — it appends to the `GameServerConnections` array
+- `RegisterGameServerAndConnectClients(const FURL&)` does the same plus routes all existing proxy clients to the new server
+- `UnregisterGameServer(int32)` removes a game server at runtime with full route/player/driver cleanup
+- `OnGameServerDisconnected` delegate fires when a game server crashes or disconnects — `DetectGameServerDisconnections()` runs every `TickFlush()`
 - Clients that connect **after** a dynamic registration automatically get routes to the new server (the proxy iterates the full `GameServerConnections` array on each `NMT_Join`)
-- `UProxyNetDriver` is exported (`MULTISERVERREPLICATION_API`) and can be subclassed by plugins
-
-**What does not work (engine limitations):**
-
-- **Existing clients** are not routed to dynamically added servers — `ConnectToGameServer()` is private to `UProxyListenerNotify` and only runs at client join time
-- There is **no `UnregisterGameServer()`** — removing a game server at runtime has no API (no route cleanup, no backend driver teardown)
-- There is **no game server crash detection** — the proxy relies on standard `UIpNetDriver` UDP timeouts with no dedicated callback or reconnection logic
-- If a game server crashes, clients routed to it will eventually be disconnected when the connection times out
-
-Fixing these gaps (retroactive routing for existing clients, server removal, crash hooks) would require engine modifications to `UProxyNetDriver` and `UProxyListenerNotify`.
+- `UProxyNetDriver` is exported (`MULTISERVERREPLICATIONEX_API`) and can be subclassed by plugins
 
 ### Orchestration notes
 
@@ -522,8 +599,9 @@ The automation of scaling decisions is **out of scope** for this plugin. An exte
 
 | Log category | Used in |
 |---|---|
-| `LogDSTM` | `FDSTMTransportModule` — module startup, delegate binding, server identity |
+| `LogDSTM` | `FMultiServerReplicationExModule` — module startup, delegate binding, server identity |
 | `LogDSTMSub` | `UDSTMSubsystem` — mesh lifecycle, peer connections, migration send/receive |
+| `LogDSTMBeacon` | `ADSTMBeaconClient` — beacon RPC send/receive |
 
 Enable verbose output:
 
@@ -532,6 +610,7 @@ Enable verbose output:
 [Core.Log]
 LogDSTM=Verbose
 LogDSTMSub=Verbose
+LogDSTMBeacon=Verbose
 ```
 
 ---
@@ -559,7 +638,7 @@ The DSTM beacon mesh has not finished connecting to the target server. Ensure:
 
 ### `Failed to deserialize FRemoteObjectData` on receive
 
-A serialization version mismatch between the two servers. Both server binaries must be built from the same source. This error can also occur if the network payload was truncated—ensure the beacon allows unlimited bunch sizes (`SetUnlimitedBunchSizeAllowed(true)` is inherited from `AMultiServerBeaconClient`).
+A serialization version mismatch between the two servers. Both server binaries must be built from the same source. This error can also occur if the network payload was truncated — ensure the beacon allows unlimited bunch sizes (`SetUnlimitedBunchSizeAllowed(true)` is inherited from `AMultiServerBeaconClient`).
 
 ### DSTM mesh created but `AreAllPeersConnected()` never returns `true`
 
@@ -570,3 +649,9 @@ A serialization version mismatch between the two servers. Both server binaries m
 ### `Reassigning NetGUID` warnings / `ObjectReplicatorReceivedBunchFail` crashes
 
 If you see these errors despite using DSTM with `UE_WITH_REMOTE_OBJECT_HANDLE=1`, check that every server has a unique `-DedicatedServerId=`. Duplicate server IDs produce duplicate `FRemoteServerId` values, which can cause identical `FRemoteObjectId` and thus identical `FNetworkGUID` values. Also verify that no hash collision exists (check the log for `DSTM HASH COLLISION` messages).
+
+---
+
+## License
+
+This plugin is a derivative of Epic Games' MultiServerReplication plugin from Unreal Engine 5.7. See [LICENSE.md](https://github.com/EpicGames/UnrealEngine/blob/release/LICENSE.md) for the Unreal Engine license terms.
