@@ -16,6 +16,7 @@
 #include "UObject/RemoteObjectTransfer.h"
 #include "UObject/RemoteObjectTypes.h"
 #include "UObject/RemoteObjectPathName.h" // FRemoteObjectTables, FPackedRemoteObjectPathName operator<<
+#include "UObject/UObjectMigrationContext.h" // FUObjectMigrationContext — direct member access replaces GetMigrationRoutingInfo()
 #endif
 
 #include UE_INLINE_GENERATED_CPP_BY_NAME(DSTMSubsystem)
@@ -311,16 +312,15 @@ bool UDSTMSubsystem::GetFirstPeerServerId(FRemoteServerId& OutServerId) const
 void UDSTMSubsystem::HandleOutgoingMigration(
 	const UE::RemoteObject::Transfer::FMigrateSendParams& Params)
 {
-	// Extract routing info from the opaque send params
-	UE::RemoteObject::Transfer::FMigrationRoutingInfo Info =
-		UE::RemoteObject::Transfer::GetMigrationRoutingInfo(Params);
+	// Extract routing info directly from the migration context (Internal header)
+	const FUObjectMigrationContext& Ctx = Params.MigrationContext;
 
 	UE_LOG(LogDSTMSub, Log,
 		TEXT("DSTM Send: ObjectId=%llu → DestServer=%u (Owner=%u, Physics=%u)"),
-		Info.ObjectId.GetIdNumber(),
-		Info.DestinationServerId.GetIdNumber(),
-		Info.OwnerServerId.GetIdNumber(),
-		Info.PhysicsServerId.GetIdNumber());
+		Ctx.ObjectId.GetIdNumber(),
+		Ctx.RemoteServerId.GetIdNumber(),
+		Ctx.OwnerServerId.GetIdNumber(),
+		Ctx.PhysicsServerId.GetIdNumber());
 
 	// Serialize FRemoteObjectData to a byte array for network transfer.
 	// Make a copy since archive serialization requires a non-const reference.
@@ -335,13 +335,13 @@ void UDSTMSubsystem::HandleOutgoingMigration(
 
 	// Find the beacon connected to the destination server
 	ADSTMBeaconClient* Beacon = FindBeaconForServer(
-		Info.DestinationServerId.GetIdNumber());
+		Ctx.RemoteServerId.GetIdNumber());
 
 	if (!Beacon)
 	{
 		UE_LOG(LogDSTMSub, Error,
 			TEXT("DSTM Send: No beacon connection to destination server %u! Migration data lost."),
-			Info.DestinationServerId.GetIdNumber());
+			Ctx.RemoteServerId.GetIdNumber());
 		return;
 	}
 
@@ -352,10 +352,10 @@ void UDSTMSubsystem::HandleOutgoingMigration(
 	{
 		// We are the server side of this beacon connection → use Client RPC
 		Beacon->ClientReceiveMigratedObject(
-			Info.ObjectId.GetIdNumber(),
-			Info.OwnerServerId.GetIdNumber(),
-			Info.PhysicsServerId.GetIdNumber(),
-			Info.PhysicsLocalIslandId,
+			Ctx.ObjectId.GetIdNumber(),
+			Ctx.OwnerServerId.GetIdNumber(),
+			Ctx.PhysicsServerId.GetIdNumber(),
+			Ctx.PhysicsLocalIslandId,
 			LocalServerId,
 			SerializedData);
 	}
@@ -363,10 +363,10 @@ void UDSTMSubsystem::HandleOutgoingMigration(
 	{
 		// We are the client side → use Server RPC
 		Beacon->ServerReceiveMigratedObject(
-			Info.ObjectId.GetIdNumber(),
-			Info.OwnerServerId.GetIdNumber(),
-			Info.PhysicsServerId.GetIdNumber(),
-			Info.PhysicsLocalIslandId,
+			Ctx.ObjectId.GetIdNumber(),
+			Ctx.OwnerServerId.GetIdNumber(),
+			Ctx.PhysicsServerId.GetIdNumber(),
+			Ctx.PhysicsLocalIslandId,
 			LocalServerId,
 			SerializedData);
 	}
