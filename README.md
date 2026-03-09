@@ -145,24 +145,39 @@ The expected server count for `AreAllPeersConnected()` is derived automatically 
 
 > **Note: No GUID seed is needed.** With `UE_WITH_REMOTE_OBJECT_HANDLE=1`, every `FNetworkGUID` is derived from `FRemoteObjectId`, which embeds the 10-bit `ServerId` — collisions between servers are structurally impossible. The seed-based `FNetGUIDCache` counter (`NetworkGuidIndex`) is compile-time excluded by the DSTM code path.
 
-### Example (two-server cluster)
+### Example (two-server cluster with proxy)
+
+A complete local launch requires three kinds of arguments per game server:
+
+1. **Engine / game** — `-server -port=<game-port>`
+2. **Engine multi-server mesh** — `-MultiServerListenPort=<port> -MultiServerPeers=<peer-mesh-addresses>`
+3. **DSTMTransport** — `-DedicatedServerId=<id> -DSTMListenPort=<port> -DSTMPeers=<peer-dstm-addresses>`
 
 ```
-# Server 1
--DedicatedServerId=server-1
--DSTMListenPort=16000
--DSTMPeers=127.0.0.1:16001
+# Server 1 (game 7777, engine mesh 15000, DSTM beacon 16000)
+-server -port=7777
+-MultiServerListenPort=15000 -MultiServerPeers=127.0.0.1:15001
+-DedicatedServerId=server-1 -DSTMListenPort=16000 -DSTMPeers=127.0.0.1:16001
 
-# Server 2
--DedicatedServerId=server-2
--DSTMListenPort=16001
--DSTMPeers=127.0.0.1:16000
+# Server 2 (game 7778, engine mesh 15001, DSTM beacon 16001)
+-server -port=7778
+-MultiServerListenPort=15001 -MultiServerPeers=127.0.0.1:15000
+-DedicatedServerId=server-2 -DSTMListenPort=16001 -DSTMPeers=127.0.0.1:16000
+
+# Proxy (connects clients to both game servers)
+-server -port=7780
+-NetDriverOverrides=/Script/MultiServerReplication.ProxyNetDriver
+-ProxyGameServers=127.0.0.1:7777,127.0.0.1:7778
 ```
 
-With these arguments:
-- Server 1 DSTM beacon listens on port **16000**
-- Server 2 DSTM beacon listens on port **16001**
-- Each server connects its DSTM beacon to the other's DSTM port
+| Port | Purpose |
+|---|---|
+| 7777–7778 | Game ports (client/proxy ↔ game server, UDP) |
+| 15000–15001 | Engine multi-server mesh (server ↔ server beacons for replication) |
+| 16000–16001 | DSTM beacon mesh (server ↔ server beacons for migration transport) |
+| 7780 | Proxy listener (client ↔ proxy, UDP) |
+
+The proxy does **not** need DSTMTransport arguments — it forwards client traffic to game servers but does not participate in server-to-server migration.
 
 ---
 
@@ -375,9 +390,9 @@ The MultiServer beacon host listens for incoming connections indefinitely after 
 
 ```
 # New server (server-3) starts with addresses of existing servers
--DedicatedServerId=server-3
--DSTMListenPort=16000
--DSTMPeers=192.168.1.10:16000,192.168.1.11:16000
+-server -port=7779
+-MultiServerListenPort=15002 -MultiServerPeers=192.168.1.10:15000,192.168.1.11:15001
+-DedicatedServerId=server-3 -DSTMListenPort=16000 -DSTMPeers=192.168.1.10:16000,192.168.1.11:16000
 ```
 
 **Flow:**
