@@ -123,13 +123,11 @@ bool UDSTMSubsystem::InitializeFromCommandLine()
 
 	InitializeDSTMMesh(LocalPeerId, ListenIp, DSTMListenPort, DSTMPeerAddresses);
 
-	// Apply GUID seed if specified (prevents FNetworkGUID collisions between servers)
-	uint64 GuidSeed = 0;
-	FParse::Value(FCommandLine::Get(), TEXT("-DSTMGuidSeed="), GuidSeed);
-	if (GuidSeed > 0)
-	{
-		ApplyGuidSeed(GuidSeed);
-	}
+	// NOTE: GUID seed is NOT needed when UE_WITH_REMOTE_OBJECT_HANDLE=1.
+	// FRemoteObjectId embeds a 10-bit ServerId into every FNetworkGUID,
+	// making collisions between servers structurally impossible.
+	// ApplyGuidSeed() is still available as a public API for non-DSTM
+	// multi-server setups, but is no longer auto-applied from the command line.
 
 	return DSTMNode != nullptr;
 #endif
@@ -301,7 +299,16 @@ void UDSTMSubsystem::TransferActorToServer(AActor* Actor, FRemoteServerId DestSe
 
 FRemoteServerId UDSTMSubsystem::GetRemoteServerIdFromString(const FString& DedicatedServerId)
 {
-	return FRemoteServerId::FromIdNumber(GetTypeHash(DedicatedServerId));
+	return FRemoteServerId::FromIdNumber(HashServerIdToRange(DedicatedServerId));
+}
+
+uint32 UDSTMSubsystem::HashServerIdToRange(const FString& DedicatedServerId)
+{
+	const uint32 Hash = GetTypeHash(DedicatedServerId);
+	constexpr uint32 MinId = static_cast<uint32>(ERemoteServerIdConstants::FirstValid);   // 1
+	constexpr uint32 MaxId = static_cast<uint32>(ERemoteServerIdConstants::FirstReserved); // 1021
+	constexpr uint32 Range = MaxId - MinId; // 1020
+	return (Hash % Range) + MinId;
 }
 
 bool UDSTMSubsystem::GetFirstPeerServerId(FRemoteServerId& OutServerId) const
@@ -468,16 +475,18 @@ void UDSTMSubsystem::HandlePeerConnected(
 
 	PeerBeacons.Add(RemotePeerId, DSTMBeacon);
 
-	// Store reverse lookup: hash → peer ID string.
+	// Store reverse lookup: hashed server ID → peer ID string.
+	// Uses HashServerIdToRange() to produce the same value as FRemoteServerId,
+	// so FindBeaconForServer(RemoteServerId.GetIdNumber()) will match.
 	// Detect hash collisions — two different DedicatedServerId strings that
-	// produce the same GetTypeHash() would silently misroute migration data.
-	const uint32 PeerHash = GetTypeHash(RemotePeerId);
+	// produce the same 10-bit ID would silently misroute migration data.
+	const uint32 PeerHash = HashServerIdToRange(RemotePeerId);
 	if (const FString* Existing = ServerIdHashToPeerId.Find(PeerHash))
 	{
 		if (*Existing != RemotePeerId)
 		{
 			UE_LOG(LogDSTMSub, Error,
-				TEXT("DSTM HASH COLLISION: DedicatedServerId '%s' and '%s' both hash to %u! "
+				TEXT("DSTM HASH COLLISION: DedicatedServerId '%s' and '%s' both map to ServerId %u! "
 					"Migration routing will be BROKEN. Rename one of the server IDs."),
 				**Existing, *RemotePeerId, PeerHash);
 		}
@@ -485,7 +494,7 @@ void UDSTMSubsystem::HandlePeerConnected(
 	ServerIdHashToPeerId.Add(PeerHash, RemotePeerId);
 
 	UE_LOG(LogDSTMSub, Log,
-		TEXT("DSTM peer registered: '%s' → hash %u"), *RemotePeerId, PeerHash);
+		TEXT("DSTM peer registered: '%s' → ServerId %u"), *RemotePeerId, PeerHash);
 
 #if UE_WITH_REMOTE_OBJECT_HANDLE
 	// Wire up delegates for incoming migration data from this peer

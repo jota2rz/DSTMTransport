@@ -15,7 +15,7 @@ A plugin for Unreal Engine 5.7 that completes the engine's built-in DSTM (Distri
 - [Migration Flow Reference](#migration-flow-reference)
 - [Pull Migration](#pull-migration)
 - [Beacon Mesh and Port Offset](#beacon-mesh-and-port-offset)
-- [GUID Seed](#guid-seed)
+- [GUID Seed (Not Needed with DSTM)](#guid-seed-not-needed-with-dstm)
 - [Runtime Scaling](#runtime-scaling)
 - [Logging](#logging)
 - [Troubleshooting](#troubleshooting)
@@ -136,13 +136,14 @@ Each server process that participates in the DSTM mesh must receive these argume
 
 | Argument | Required | Description |
 |----------|----------|-------------|
-| `-DedicatedServerId=<string>` | Yes | Unique string identifier for this server (e.g. `server-1`). Hashed to a `uint32` via `GetTypeHash()` to produce the `FRemoteServerId`. Also used as the beacon mesh `LocalPeerId` for peer identification. |
+| `-DedicatedServerId=<string>` | Yes | Unique string identifier for this server (e.g. `server-1`). Hashed into a 10-bit `FRemoteServerId` in range [1, 1020] via `GetTypeHash() % 1020 + 1`. Also used as the beacon mesh `LocalPeerId` for peer identification. |
 | `-MultiServerListenPort=<int>` | Yes | Base port for the main MultiServer mesh. The DSTM mesh listens on this port + 1000. |
 | `-MultiServerListenIp=<ip>` | No | IP address to bind the DSTM beacon listener. Defaults to `0.0.0.0`. |
 | `-MultiServerPeers=<ip:port,...>` | Yes (multi-server) | Comma-separated list of `host:port` pairs for other servers' **main** MultiServer mesh ports. The plugin automatically adds +1000 to each port for the DSTM mesh. |
-| `-DSTMGuidSeed=<uint64>` | Recommended | GUID allocation seed for the server's `FNetGUIDCache`. Each server must use a distinct value (e.g. `100000`, `200000`) to prevent `FNetworkGUID` collisions in the proxy's shared backend cache. See [GUID Seed](#guid-seed). |
 
 The expected server count for `AreAllPeersConnected()` is derived automatically as `PeerAddresses.Num() + 1` (peers + self). No separate count argument is needed.
+
+> **Note: No GUID seed is needed.** With `UE_WITH_REMOTE_OBJECT_HANDLE=1`, every `FNetworkGUID` is derived from `FRemoteObjectId`, which embeds the 10-bit `ServerId` — collisions between servers are structurally impossible. The seed-based `FNetGUIDCache` counter (`NetworkGuidIndex`) is compile-time excluded by the DSTM code path.
 
 ### Example (two-server cluster)
 
@@ -151,13 +152,11 @@ The expected server count for `AreAllPeersConnected()` is derived automatically 
 -DedicatedServerId=server-1
 -MultiServerListenPort=15000
 -MultiServerPeers=127.0.0.1:15001
--DSTMGuidSeed=100000
 
 # Server 2
 -DedicatedServerId=server-2
 -MultiServerListenPort=15001
 -MultiServerPeers=127.0.0.1:15000
--DSTMGuidSeed=200000
 ```
 
 With these arguments:
@@ -338,66 +337,39 @@ If you initialize the mesh explicitly (not via command-line), supply the already
 
 ### Server identity hashing
 
-`FRemoteServerId` is a `uint32`. The plugin derives it from a human-readable string (`DedicatedServerId`) using `GetTypeHash(FString)`:
+`FRemoteObjectId` packs a 10-bit `ServerId` field (valid range 1–1020) alongside a 53-bit serial number. The plugin derives the `FRemoteServerId` from a human-readable string using a bounded hash:
 
 ```cpp
-FRemoteServerId id = FRemoteServerId::FromIdNumber(GetTypeHash(TEXT("server-1")));
+// HashServerIdToRange(): (GetTypeHash(str) % 1020) + 1 → [1, 1020]
+FRemoteServerId id = UDSTMSubsystem::GetRemoteServerIdFromString(TEXT("server-1"));
 ```
 
-`GetRemoteServerIdFromString()` performs this hash publicly so your game code can produce the same value when specifying migration targets.
+Both `InitializeServerIdentity()` (in the module) and `GetRemoteServerIdFromString()` / `HashServerIdToRange()` (in the subsystem) use the same formula. `HashServerIdToRange()` is a public static method for use in game code.
 
 ### Hash collision detection
 
-Because `GetTypeHash()` maps an arbitrary `FString` to a `uint32`, two different server IDs could theoretically produce the same hash. A collision would silently misroute migration data to the wrong server.
+Because the hash maps an arbitrary `FString` into only 1020 slots, two different server IDs could produce the same bounded hash. A collision would silently misroute migration data and, worse, make `FRemoteServerId::InitGlobalServerId()` assign duplicate identities to two different servers.
 
 The plugin detects this at runtime: when a new peer connects, `HandlePeerConnected()` checks whether the computed hash already maps to a **different** peer ID. If a collision is detected, an `Error`-level log is emitted:
 
 ```
-DSTM HASH COLLISION: DedicatedServerId 'zone-alpha' and 'zone-beta' both hash to 1234567890!
+DSTM HASH COLLISION: DedicatedServerId 'zone-alpha' and 'zone-beta' both map to ServerId 42!
 Migration routing will be BROKEN. Rename one of the server IDs.
 ```
 
-In practice, collisions are extremely unlikely for typical server names (`server-1`, `server-2`, `zone-west`, etc.). If you encounter one, simply rename one of the colliding servers.
+For small clusters (< 20 servers), collisions are very unlikely. By the birthday paradox, collision probability reaches ~50% around 38 servers. For large deployments, test your naming scheme and monitor the log. If you encounter a collision, simply rename one of the colliding servers.
 
 ---
 
-## GUID Seed
+## GUID Seed (Not Needed with DSTM)
 
-### Why it's needed
+With `UE_WITH_REMOTE_OBJECT_HANDLE=1`, the engine derives every `FNetworkGUID` from `FRemoteObjectId` — a 64-bit value that embeds a 10-bit `ServerId` and a 53-bit `SerialNumber`. Because each server has a distinct `ServerId` baked into the ID, GUIDs from different servers are **structurally non-overlapping**. No manual seed is required.
 
-In a multi-server topology with a shared proxy, each backend server allocates `FNetworkGUID` values sequentially starting from the same counter. When Server-1 spawns a `PlayerController` (gets GUID 4) and Server-2 also spawns one (also gets GUID 4), the proxy's shared backend `FNetGUIDCache` encounters a collision — it reassigns the GUID mapping, corrupting replication and potentially crashing.
+The seed-based `FNetGUIDCache` counter (`NetworkGuidIndex`) that would normally need offsetting is compile-time **excluded** by the `#if UE_WITH_REMOTE_OBJECT_HANDLE` branches in `AssignNewNetGUID_Server()` and `AssignNewNetGUIDFromPath_Server()`.
 
-This is a **separate concern from DSTM**. DSTM uses `FRemoteObjectId` for cross-server object identity during migration. The GUID seed prevents proxy-level `FNetworkGUID` collisions during normal replication, which are equally problematic with or without DSTM.
+### Legacy `ApplyGuidSeed()` API
 
-### How it works
-
-The plugin replaces the `NetDriver`'s `GuidCache` with a new `FNetGUIDCache` initialized with the specified seed via the `GetNetGuidCache()` accessor (avoiding direct member access to the deprecated `GuidCache` field). The seed offsets the GUID counter so that servers allocate from disjoint ranges:
-
-| Server | Seed | GUID range |
-|--------|------|-----------|
-| server-1 | 100000 | 100001, 100002, 100003, ... |
-| server-2 | 200000 | 200001, 200002, 200003, ... |
-| server-3 | 300000 | 300001, 300002, 300003, ... |
-
-### Command-line usage
-
-```
--DSTMGuidSeed=100000   # Server 1
--DSTMGuidSeed=200000   # Server 2
-```
-
-The `InitializeFromCommandLine()` method reads this argument and calls `ApplyGuidSeed()` automatically.
-
-### Programmatic usage
-
-```cpp
-UDSTMSubsystem* DSTM = GetGameInstance()->GetSubsystem<UDSTMSubsystem>();
-DSTM->ApplyGuidSeed(100000);  // Call before any clients connect
-```
-
-### Shipping builds
-
-The engine's built-in `-NetworkGuidSeed=` parameter is gated by `#if !UE_BUILD_SHIPPING` and doesn't work in Shipping builds. The plugin's `ApplyGuidSeed()` uses the `GetNetGuidCache()` accessor (which returns a mutable `TSharedPtr<FNetGUIDCache>&`) and the public `ENGINE_API` constructor, so it works in **all build configurations** including Shipping and is forward-compatible with Epic's planned deprecation of the `GuidCache` member variable.
+The `ApplyGuidSeed(uint64)` method is still available as a public API for **non-DSTM** multi-server setups where servers share a proxy with overlapping GUID spaces. It is no longer called automatically from `InitializeFromCommandLine()` and the `-DSTMGuidSeed=` command-line argument has been removed.
 
 ---
 
@@ -414,7 +386,6 @@ The MultiServer beacon host listens for incoming connections indefinitely after 
 -DedicatedServerId=server-3
 -MultiServerListenPort=15000
 -MultiServerPeers=192.168.1.10:15000,192.168.1.11:15000
--DSTMGuidSeed=300000
 ```
 
 **Flow:**
@@ -507,7 +478,7 @@ This is an engine-level limitation in UE 5.7's `UProxyNetDriver`. Dynamic proxy 
 
 The automation of scaling decisions is **out of scope** for this plugin. An external application should handle:
 - When to spin up / tear down server instances
-- Assigning unique `-DedicatedServerId=` and `-DSTMGuidSeed=` values
+- Assigning unique `-DedicatedServerId=` values
 - Providing the correct `-MultiServerPeers=` addresses to new servers
 - Deciding which server to migrate players *to* before shutting down a server
 
@@ -564,4 +535,4 @@ A serialization version mismatch between the two servers. Both server binaries m
 
 ### `Reassigning NetGUID` warnings / `ObjectReplicatorReceivedBunchFail` crashes
 
-GUID collisions between backend servers. Each server must use a distinct `-DSTMGuidSeed=` value so that independently spawned actors (PlayerControllers, PlayerStates, Pawns, NoPawnPlayerControllers) get non-overlapping GUIDs. Without this, Server-1's GUID 4 → PlayerController and Server-2's GUID 4 → NoPawnPlayerController collide in the proxy's shared `FNetGUIDCache`, causing replication data to be applied to the wrong object type. See [GUID Seed](#guid-seed).
+If you see these errors despite using DSTM with `UE_WITH_REMOTE_OBJECT_HANDLE=1`, check that every server has a unique `-DedicatedServerId=`. Duplicate server IDs produce duplicate `FRemoteServerId` values, which can cause identical `FRemoteObjectId` and thus identical `FNetworkGUID` values. Also verify that no hash collision exists (check the log for `DSTM HASH COLLISION` messages).

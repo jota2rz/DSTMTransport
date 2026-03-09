@@ -57,8 +57,15 @@ void FDSTMTransportModule::InitializeServerIdentity()
 		return;
 	}
 
-	// Hash the string ID to a uint32 for FRemoteServerId
-	const uint32 ServerId = GetTypeHash(ServerIdStr);
+	// FRemoteServerId is packed into a 10-bit field inside FRemoteObjectId
+	// (REMOTE_OBJECT_SERVER_ID_BIT_SIZE = 10). The valid range is
+	// [FirstValid(1) .. FirstReserved-1(1020)], giving 1020 usable IDs.
+	// Hash the human-readable string into that range.
+	const uint32 Hash = GetTypeHash(ServerIdStr);
+	constexpr uint32 MinId = static_cast<uint32>(ERemoteServerIdConstants::FirstValid);  // 1
+	constexpr uint32 MaxId = static_cast<uint32>(ERemoteServerIdConstants::FirstReserved); // 1021
+	constexpr uint32 Range = MaxId - MinId;  // 1020
+	const uint32 ServerId = (Hash % Range) + MinId;
 
 	// InitGlobalServerId can only be called once — it asserts on re-initialization.
 	// This must happen before any UObjects are allocated with remote object handles.
@@ -66,8 +73,8 @@ void FDSTMTransportModule::InitializeServerIdentity()
 	bServerIdentityInitialized = true;
 
 	UE_LOG(LogDSTM, Log,
-		TEXT("DSTMTransport: Server identity initialized — DedicatedServerId='%s' → FRemoteServerId=%u"),
-		*ServerIdStr, ServerId);
+		TEXT("DSTMTransport: Server identity initialized — DedicatedServerId='%s' → FRemoteServerId=%u (hash %u mod %u + %u)"),
+		*ServerIdStr, ServerId, Hash, Range, MinId);
 #else
 	UE_LOG(LogDSTM, Warning,
 		TEXT("DSTMTransport: UE_WITH_REMOTE_OBJECT_HANDLE is disabled. "

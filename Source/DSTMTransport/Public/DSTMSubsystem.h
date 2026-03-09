@@ -107,18 +107,17 @@ public:
 	void ShutdownMesh();
 
 	/**
-	 * Apply a GUID seed to prevent FNetworkGUID collisions between backend servers.
-	 * Each server in a multi-server cluster must use a distinct seed value so that
-	 * independently spawned actors (PlayerControllers, Pawns, etc.) get non-overlapping
-	 * GUIDs in the proxy's shared backend GUID cache.
+	 * Apply a GUID seed to the NetDriver's FNetGUIDCache.
 	 *
-	 * This is a separate concern from DSTM's FRemoteObjectId identity system — GuidSeed
-	 * prevents proxy-level GUID collisions during normal replication, while DSTM handles
-	 * cross-server object identity during migration.
+	 * NOTE: This is NOT needed when using DSTM (UE_WITH_REMOTE_OBJECT_HANDLE=1).
+	 * With DSTM, every FNetworkGUID is derived from FRemoteObjectId which embeds a
+	 * 10-bit ServerId — collisions between servers are structurally impossible.
+	 * The seed-based counter in FNetGUIDCache is compile-time excluded by DSTM.
 	 *
-	 * Call this before any clients connect (typically from GameMode::StartPlay()).
+	 * This method is retained as a public API for non-DSTM multi-server setups
+	 * where servers share a proxy with overlapping GUID spaces.
 	 *
-	 * @param GuidSeed - Non-zero seed value (e.g. 100000 for server-1, 200000 for server-2)
+	 * @param GuidSeed - Non-zero seed value applied to FNetGUIDCache::NetworkGuidIndex
 	 */
 	UFUNCTION(BlueprintCallable, Category = "DSTM")
 	void ApplyGuidSeed(uint64 GuidSeed);
@@ -126,6 +125,18 @@ public:
 	// ──── Migration API ────
 
 #if UE_WITH_REMOTE_OBJECT_HANDLE
+	/**
+	 * Hash a DedicatedServerId string into the valid FRemoteServerId range [1, 1020].
+	 *
+	 * FRemoteObjectId packs ServerId into a 10-bit field with reserved values:
+	 *   Invalid=0, Local=1021, Asset=1022, Database=1023
+	 * This gives 1020 usable IDs (FirstValid=1 .. FirstReserved-1=1020).
+	 *
+	 * All code that converts a string server ID to FRemoteServerId MUST use
+	 * this function to ensure consistency.
+	 */
+	static uint32 HashServerIdToRange(const FString& DedicatedServerId);
+
 	/**
 	 * Transfer an actor to a remote server using the DSTM pipeline.
 	 * Calls UE::RemoteObject::Transfer::TransferObjectOwnershipToRemoteServer().
@@ -137,7 +148,7 @@ public:
 
 	/**
 	 * Get the FRemoteServerId for a peer by its DedicatedServerId string.
-	 * Uses the same hash as InitializeServerIdentity() for consistency.
+	 * Uses HashServerIdToRange() for consistency with InitializeServerIdentity().
 	 */
 	static FRemoteServerId GetRemoteServerIdFromString(const FString& DedicatedServerId);
 
@@ -197,7 +208,8 @@ private:
 	 */
 	static TArray<FString> OffsetPeerPorts(const TArray<FString>& PeerAddresses, int32 Offset);
 
-	/** Find the beacon client connected to a specific server. */
+	/** Find the beacon client connected to a server by its FRemoteServerId ID number.
+	 *  The key matches HashServerIdToRange() output / FRemoteServerId::GetIdNumber(). */
 	ADSTMBeaconClient* FindBeaconForServer(uint32 ServerIdHash) const;
 
 	UPROPERTY()
