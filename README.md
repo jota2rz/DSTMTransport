@@ -113,11 +113,20 @@ The DSTM beacon mesh is a separate `UMultiServerNode` instance from any game-lev
 
 ## Engine Build Requirement
 
-The plugin requires an engine build where `UE_WITH_REMOTE_OBJECT_HANDLE` is set to `1`. In the UE 5.7 source repository this defaults to `1` (see `CoreMiscDefines.h`), but the pre-built/installed engine may have it set to `0`. Verify by checking `Engine/Source/Runtime/Core/Public/Misc/CoreMiscDefines.h` for the define value.
+This plugin requires **one engine source modification**: setting `UE_WITH_REMOTE_OBJECT_HANDLE` to `1` in `Engine/Source/Runtime/Core/Public/Misc/CoreMiscDefines.h`. The stock UE 5.7 default is `0`.
+
+```cpp
+// CoreMiscDefines.h — change required
+#ifndef UE_WITH_REMOTE_OBJECT_HANDLE
+    #define UE_WITH_REMOTE_OBJECT_HANDLE 1   // stock default is 0
+#endif
+```
+
+This is the **only** engine change needed. No other engine source files are modified.
 
 If the define is `0`, the plugin compiles but remains inert: the module logs a warning, skips delegate binding, and the subsystem reports `IsMeshActive() == false`.
 
-> **Important:** Setting `UE_WITH_REMOTE_OBJECT_HANDLE=1` changes `FObjectHandle` from a simple pointer to `FRemoteObjectHandlePrivate` (tagged pointer union). Every `TObjectPtr<>` in the engine changes ABI. All modules (engine, plugins, game) must be compiled against the same setting. A pre-built/installed engine cannot be mixed with a source-built one.
+> **Important:** Setting `UE_WITH_REMOTE_OBJECT_HANDLE=1` changes `FObjectHandle` from a simple pointer to `FRemoteObjectHandlePrivate` (tagged pointer union). Every `TObjectPtr<>` in the engine changes ABI. All modules (engine, plugins, game) must be compiled against the same setting. A pre-built/installed engine cannot be mixed with a source-built one. You must build the engine from source with this change.
 
 ---
 
