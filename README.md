@@ -26,6 +26,7 @@ This plugin combines two concerns into a single module:
 - [Dynamic Proxy](#dynamic-proxy)
 - [Logging](#logging)
 - [Troubleshooting](#troubleshooting)
+- [Known Issues](#known-issues)
 - [License](#license)
 
 ---
@@ -222,6 +223,52 @@ If the define is `0` (or absent), the plugin compiles but the DSTM transport rem
 
 > **ABI note:** Setting `UE_WITH_REMOTE_OBJECT_HANDLE=1` changes `FWeakObjectPtr` layout (adds `FRemoteObjectId`, growing it from 8 to 16 bytes). All modules linked into the server binary must be compiled with the same setting. This happens automatically when using `GlobalDefinitions` in the target — UBT recompiles everything for that target configuration.
 
+### Runtime requirement: Disable garbage elimination
+
+At runtime, `UE_WITH_REMOTE_OBJECT_HANDLE=1` requires garbage elimination to be disabled. If it is not, the server crashes on startup with:
+
+```
+Assertion failed: !IsGarbageEliminationEnabled()
+"Remote object support requires garbage elimination to be disabled"
+[ObjectBaseUtility.cpp]
+```
+
+Pass `-DisableGarbageElimination` on the command line to every server process that was built with `UE_WITH_REMOTE_OBJECT_HANDLE=1`. This sets the CVar `gc.GarbageEliminationEnabled` to `false` during `InitGarbageElimination()`. The flag is parsed in `Engine/Source/Runtime/CoreUObject/Private/UObject/ObjectBaseUtility.cpp`.
+
+> **Note:** The proxy server also requires this flag if it was compiled from the same source-built engine with `UE_WITH_REMOTE_OBJECT_HANDLE=1`.
+
+### NetDriver configuration in DefaultEngine.ini
+
+The engine multi-server mesh requires a `NetDriverDefinitions` entry in `DefaultEngine.ini`. Use the `Ex` module name to match this plugin:
+
+```ini
+[/Script/Engine.Engine]
++NetDriverDefinitions=(DefName="MultiServerNetDriver",DriverClassName="/Script/MultiServerReplicationEx.MultiServerNetDriver",DriverClassNameFallback="/Script/MultiServerReplicationEx.MultiServerNetDriver")
+```
+
+> **Common mistake:** If using the stock module path `/Script/MultiServerReplication.MultiServerNetDriver`, the driver will fail to load: `CreateNamedNetDriver failed to create driver from definition MultiServerNetDriver`. Always use `/Script/MultiServerReplicationEx.*` with this plugin.
+
+### Network version compatibility (mixed builds)
+
+If you build your dedicated server from engine source but use the installed (Epic Launcher) engine for editor/client builds, the server's `FNetworkVersion` changelist will be `0` while the client's will be a non-zero value (e.g., `47537391`). This causes the client to be rejected with `NMT_Failure` / `OutdatedClient`.
+
+To allow mixed-build connections, override the network version check in your game module:
+
+```cpp
+#include "Misc/NetworkVersion.h"
+
+void FYourGameModule::StartupModule()
+{
+    FNetworkVersion::IsNetworkCompatibleOverride.BindLambda(
+        [](uint32 LocalNetworkVersion, uint32 RemoteNetworkVersion)
+        {
+            return true; // Allow source-built server ↔ installed client
+        });
+}
+```
+
+> **Warning:** This bypasses all network version checking. Do not ship this in production — use a more targeted check that validates your own protocol version instead.
+
 ---
 
 ## Architecture
@@ -272,7 +319,8 @@ Each server process that participates in the DSTM mesh must receive these argume
 
 | Argument | Required | Description |
 |----------|----------|-------------|
-| `-DedicatedServerId=<string>` | Yes | Unique string identifier for this server (e.g. `server-1`). Hashed into a 10-bit `FRemoteServerId` in range [1, 1020] via `GetTypeHash() % 1020 + 1`. Also used as the DSTM beacon mesh `LocalPeerId` for peer identification. |
+| `-DedicatedServerId=<string>` | Yes | Unique string identifier for this server (e.g. `server-1`). Hashed into a 10-bit `FRemoteServerId` in range [1, 1020] via `GetTypeHash() % 1020 + 1`. Also used as the DSTM beacon mesh `LocalPeerId` for peer identification. **Proxy servers also need this flag** — `FRemoteServerId::InitGlobalServerId()` must be called before the engine touches any remote object types, even on the proxy. |
+| `-DisableGarbageElimination` | Yes | Disables UE garbage elimination (CVar `gc.GarbageEliminationEnabled`). **Required at runtime** when the binary is compiled with `UE_WITH_REMOTE_OBJECT_HANDLE=1` — the server will crash on startup without it. See [Engine Build Requirement](#engine-build-requirement). |
 | `-DSTMListenPort=<int>` | Yes | Port for the DSTM beacon listener. Each server needs a unique port (per host). Defaults to `16000`. |
 | `-DSTMListenIp=<ip>` | No | IP address to bind the DSTM beacon listener. Useful when servers should communicate over a private network interface separate from the game port. Defaults to `0.0.0.0`. |
 | `-DSTMPeers=<ip:port,...>` | Yes (multi-server) | Comma-separated list of `host:port` pairs pointing to other servers' DSTM beacon ports. |
@@ -313,17 +361,18 @@ A complete local launch requires three kinds of arguments per game server:
 
 ```
 # Server 1 (game 7777, engine mesh 15000, DSTM beacon 16000)
--server -port=7777
+-server -port=7777 -DisableGarbageElimination
 -MultiServerListenPort=15000 -MultiServerPeers=127.0.0.1:15001
 -DedicatedServerId=server-1 -DSTMListenPort=16000 -DSTMPeers=127.0.0.1:16001
 
 # Server 2 (game 7778, engine mesh 15001, DSTM beacon 16001)
--server -port=7778
+-server -port=7778 -DisableGarbageElimination
 -MultiServerListenPort=15001 -MultiServerPeers=127.0.0.1:15000
 -DedicatedServerId=server-2 -DSTMListenPort=16001 -DSTMPeers=127.0.0.1:16000
 
 # Proxy (connects clients to both game servers)
--server -port=7780
+-server -port=7780 -DisableGarbageElimination
+-DedicatedServerId=proxy-1
 -NetDriverOverrides=/Script/MultiServerReplicationEx.ProxyNetDriver
 -ProxyGameServers=127.0.0.1:7777,127.0.0.1:7778
 ```
@@ -335,7 +384,7 @@ A complete local launch requires three kinds of arguments per game server:
 | 16000–16001 | DSTM beacon mesh (server ↔ server beacons for migration transport) |
 | 7780 | Proxy listener (client ↔ proxy, UDP) |
 
-The proxy does **not** need DSTM arguments — it forwards client traffic to game servers but does not participate in server-to-server migration.
+The proxy does **not** need DSTM mesh arguments (`-DSTMListenPort`, `-DSTMPeers`) — it forwards client traffic to game servers but does not participate in server-to-server migration. However, it **does** need `-DedicatedServerId=` and `-DisableGarbageElimination` because the global server identity must be initialized before the engine touches any remote object types.
 
 ---
 
@@ -708,6 +757,88 @@ A serialization version mismatch between the two servers. Both server binaries m
 ### `Reassigning NetGUID` warnings / `ObjectReplicatorReceivedBunchFail` crashes
 
 If you see these errors despite using DSTM with `UE_WITH_REMOTE_OBJECT_HANDLE=1`, check that every server has a unique `-DedicatedServerId=`. Duplicate server IDs produce duplicate `FRemoteServerId` values, which can cause identical `FRemoteObjectId` and thus identical `FNetworkGUID` values. Also verify that no hash collision exists (check the log for `DSTM HASH COLLISION` messages).
+
+### `Remote object support requires garbage elimination to be disabled` crash at startup
+
+The server process was compiled with `UE_WITH_REMOTE_OBJECT_HANDLE=1` but launched without `-DisableGarbageElimination`. The assertion fires in `InitGarbageElimination()` before the engine reaches `Init()`. Add `-DisableGarbageElimination` to the server's command line.
+
+### `GlobalServerId.Id != Local...Global server id hasn't been initialized yet` crash (proxy)
+
+The proxy was launched without `-DedicatedServerId=`. Even though the proxy does not participate in migration, the engine's remote object type system requires a global server identity. Add `-DedicatedServerId=proxy-1` (or any unique name) to the proxy command line.
+
+### `CreateNamedNetDriver failed to create driver from definition MultiServerNetDriver`
+
+The `DefaultEngine.ini` `NetDriverDefinitions` entry references an incorrect class path. With this plugin, use:
+
+```ini
++NetDriverDefinitions=(DefName="MultiServerNetDriver",DriverClassName="/Script/MultiServerReplicationEx.MultiServerNetDriver",...)
+```
+
+Do **not** use `/Script/MultiServerReplication.MultiServerNetDriver` — that references the stock engine plugin which is not loaded.
+
+### `NMT_Failure` / `OutdatedClient` — server rejects client connection
+
+This happens when the server and client are built with different engines. A source-built server has `FNetworkVersion` changelist `0`, while an Epic Launcher client has a non-zero changelist (e.g., `47537391`). See [Network version compatibility](#network-version-compatibility-mixed-builds) for the workaround.
+
+### `SetAutonomousProxy called on a unreplicated actor` spam (proxy)
+
+The proxy logs this warning when a backend game server disconnects or crashes while a player is mid-migration. The proxy still holds references to a `PlayerController` that was created during the migration handoff but never fully replicated. The warning is cosmetic — the proxy will clean up the orphaned connection when it detects the backend disconnect via `DetectGameServerDisconnections()`.
+
+---
+
+## Known Issues
+
+These are engine-level bugs in UE 5.7's DSTM framework that affect cross-server player migration. The migration data itself serializes and transfers correctly via the plugin, but the engine crashes when processing migrated remote objects after the transfer completes.
+
+### Source server crash: `GTransferQueue.ActiveRequest` assertion during `ServerReplicateActors`
+
+**Symptom:** After a player crosses a zone boundary and the DSTM transfer is initiated, the source server crashes with:
+
+```
+Assertion failed: GTransferQueue.ActiveRequest
+"Attempting to access remote object <ObjectId> but we are outside of a transaction"
+[RemoteObjectTransfer.cpp]
+```
+
+**Callstack:**
+```
+ServerReplicateActors()
+  └─ GatherActorListsForConnection()
+       └─ UReplicationGraphNode_AlwaysRelevant_ForConnection::AddCachedRelevantActor()
+            └─ FWeakObjectPtr::TryResolveRemoteObject()
+                 └─ UE::RemoteObject::Transfer::MigrateObjectFromRemoteServer()
+                      └─ ResolveObject()
+```
+
+**Root cause:** After the source server sends the migration payload, the player's actor is removed from the world but a `FWeakObjectPtr` to the migrated actor remains in the ReplicationGraph's always-relevant node cache. On the next `ServerReplicateActors()` tick, the replication graph tries to resolve this weak pointer, which triggers `TryResolveRemoteObject()`. This calls into the DSTM transfer pipeline, but there is no active transaction context — `GTransferQueue.ActiveRequest` is `nullptr` because the engine only creates transaction contexts during explicit `TransferObjectOwnership` calls, not during replication graph traversal.
+
+**Status:** Engine bug. The replication graph needs to be notified when an actor is migrated so it can purge stale weak pointers from its caches before the next replication tick.
+
+### Destination server crash: `AutoRTFM::IsClosed()` assertion during `TickActor`
+
+**Symptom:** After the destination server receives DSTM migration data and feeds it to the engine's receive pipeline, the server crashes with:
+
+```
+Assertion failed: AutoRTFM::IsClosed()
+[RemoteExecutor.cpp]
+```
+
+**Callstack:**
+```
+FTickFunctionTask::DoTask()
+  └─ APlayerController::TickActor()
+       └─ ResolveObjectHandleNoRead()
+            └─ ResolveObject()
+                 └─ UE::RemoteObject::Transfer::MigrateObjectFromRemoteServer()
+```
+
+**Root cause:** The migrated `APlayerController` contains `FObjectHandle` references that were serialized with remote object IDs from the source server. When the destination server ticks the just-received PlayerController, these handles attempt lazy resolution via `ResolveObjectHandleNoRead()`, which triggers `MigrateObjectFromRemoteServer()`. This path requires an active AutoRTFM closed transaction context (`AutoRTFM::IsClosed()` must return `true`), but actor ticking runs in the open transaction context. The engine's DSTM receive pipeline does not wrap post-migration actor ticking in a closed transaction.
+
+**Status:** Engine bug. The DSTM receive pipeline needs to ensure that all object handle references in the migrated actor are fully resolved within the closed transaction context before the actor begins ticking in the open world.
+
+### Both crashes occur simultaneously
+
+Because the source server initiates migration and the destination receives it on the same frame (or within 1–2 frames), both crashes typically occur together — the source crashes during its next `ServerReplicateActors()` and the destination crashes during its first `TickActor()` of the migrated PlayerController.
 
 ---
 
