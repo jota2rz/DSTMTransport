@@ -599,6 +599,22 @@ void UDSTMSubsystem::HandleIncomingMigrationData(
 
 	UE_LOG(LogDSTMSub, Log,
 		TEXT("DSTM Recv: ObjectId=%llu delivered to engine receive pipeline"), ObjectIdRaw);
+
+	// Resolve the arrived actor and broadcast to subscribers.
+	// After OnObjectDataReceived, the actor is in the world (PostMigrate(Receive) ran).
+	const FRemoteObjectId ArrivedId = FRemoteObjectId::CreateFromInt(ObjectIdRaw);
+	if (UWorld* World = GetWorld())
+	{
+		for (TActorIterator<AActor> It(World); It; ++It)
+		{
+			const FRemoteObjectId ActorId(*It);
+			if (ActorId.IsValid() && ActorId == ArrivedId)
+			{
+				OnActorArrived.Broadcast(*It);
+				break;
+			}
+		}
+	}
 }
 
 void UDSTMSubsystem::HandleIncomingMigrationRequest(

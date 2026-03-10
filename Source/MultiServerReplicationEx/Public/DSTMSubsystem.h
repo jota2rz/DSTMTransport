@@ -16,6 +16,9 @@ class UMultiServerNode;
 class AMultiServerBeaconClient;
 class ADSTMBeaconClient;
 
+/** Delegate fired when a migrated actor arrives via DSTM. */
+DECLARE_MULTICAST_DELEGATE_OneParam(FOnDSTMActorArrived, AActor* /*ArrivedActor*/);
+
 /**
  * Manages the DSTM beacon transport mesh for seamless cross-server migration.
  *
@@ -165,6 +168,14 @@ public:
 
 	/** Handle outgoing migration: serialize FRemoteObjectData and send via beacon. */
 	void HandleOutgoingMigration(const UE::RemoteObject::Transfer::FMigrateSendParams& Params);
+
+	/**
+	 * Delegate broadcast immediately after a migrated actor is received and
+	 * added to the world via OnObjectDataReceived(). Subscribe to handle
+	 * post-arrival setup (e.g. zone info, persistence registration) with
+	 * zero polling delay.
+	 */
+	FOnDSTMActorArrived OnActorArrived;
 
 	/** Handle incoming pull-request: forward to the appropriate peer. */
 	void HandleObjectRequest(
