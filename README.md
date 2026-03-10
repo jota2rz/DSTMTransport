@@ -18,6 +18,7 @@ This plugin combines two concerns into a single module:
 - [Command-Line Arguments](#command-line-arguments)
 - [Initialization](#initialization)
 - [Migrating an Actor](#migrating-an-actor)
+- [Pawn Handling During Migration](#pawn-handling-during-migration)
 - [Migration Flow Reference](#migration-flow-reference)
 - [Pull Migration](#pull-migration)
 - [Beacon Mesh](#beacon-mesh)
@@ -26,7 +27,7 @@ This plugin combines two concerns into a single module:
 - [Dynamic Proxy](#dynamic-proxy)
 - [Logging](#logging)
 - [Troubleshooting](#troubleshooting)
-- [Known Issues](#known-issues)
+- [Known Issues & Required Engine Patches](#known-issues--required-engine-patches)
 - [License](#license)
 
 ---
@@ -469,7 +470,7 @@ DSTM->TransferActorToServer(PlayerController, DestId);
 3. For player controllers: calls `APlayerController::PostMigrate(Send)` — swaps in a `NoPawnPC`, saves the connection handle
 4. Invokes `RemoteObjectTransferDelegate` → `HandleOutgoingMigration()` → sends via beacon RPC
 
-> **Important:** Only pass the `PlayerController`. The possessed `Pawn` is automatically included as a subobject. Passing both separately causes a double-transfer and will corrupt the migration.
+> **Important:** The possessed `Pawn` is a **separate actor**, not a subobject of the PlayerController. `TransferObjectOwnershipToRemoteServer(PC)` transfers the PC and its component hierarchy, but **does not include the Pawn**. Your game code must handle pawn lifecycle on both sides — see [Pawn Handling During Migration](#pawn-handling-during-migration).
 
 ### Convenience: first connected peer
 
@@ -480,6 +481,85 @@ FRemoteServerId PeerId;
 if (DSTM->GetFirstPeerServerId(PeerId))
 {
     DSTM->TransferActorToServer(PlayerController, PeerId);
+}
+```
+
+---
+
+## Pawn Handling During Migration
+
+The DSTM transfer serializes the PlayerController and its **component subobjects** (e.g., `USceneComponent` root, camera manager). The possessed **Pawn** (e.g., `ACharacter`) is a separate actor and is **not** included in the transfer. Your game code is responsible for:
+
+1. **Sending server** — destroy the pawn before (or immediately after) calling `TransferActorToServer()`
+2. **Receiving server** — detect the pawnless migrated PC and spawn a new pawn
+
+### Sending server: stamp position and destroy pawn
+
+Before transferring the PC, capture the pawn's world transform and stamp it onto the PC's root component so the receiving server knows where to place the new pawn. Then destroy the pawn to prevent a "ghost" (frozen character with last animation) remaining visible on the sending server.
+
+```cpp
+void AYourGameMode::MigratePlayer(APlayerController* PC, ACharacter* Pawn)
+{
+    UDSTMSubsystem* DSTM = GetGameInstance()->GetSubsystem<UDSTMSubsystem>();
+    FRemoteServerId DestId;
+    if (!DSTM || !DSTM->GetFirstPeerServerId(DestId)) return;
+
+    // 1. Capture pawn position
+    const FVector PawnPos = Pawn->GetActorLocation();
+    const FRotator PawnRot = Pawn->GetActorRotation();
+
+    // 2. Stamp onto PC's root component (AController hides SetActorLocation)
+    if (USceneComponent* Root = PC->GetRootComponent())
+    {
+        Root->SetWorldLocationAndRotation(PawnPos, PawnRot);
+    }
+
+    // 3. Destroy pawn on sending server
+    PC->UnPossess();
+    Pawn->Destroy();
+
+    // 4. Transfer the pawnless PC — position is carried in root component
+    DSTM->TransferActorToServer(PC, DestId);
+}
+```
+
+> **Why destroy the pawn?** If the pawn survives on the sending server, `CheckZoneBoundaries()` (or similar logic) will read the pawn's drifting position and trigger another migration on the next tick — causing an infinite ping-pong loop between servers. _The pawn must not exist on the sending server after migration._
+
+### Receiving server: detect migrated PC and spawn pawn
+
+After `PostMigrate(Receive)` binds the PC to the `ChildConnection`, the PC appears in the player controller iterator with a valid `Player` but no possessed pawn. Detect this in your tick/boundary-check and spawn a fresh pawn:
+
+```cpp
+void AYourGameMode::HandleMigratedPlayerArrival(APlayerController* PC)
+{
+    // Read position from the PC's root component (stamped by sending server)
+    USceneComponent* Root = PC->GetRootComponent();
+    const FVector Pos = Root ? Root->GetComponentLocation() : FVector::ZeroVector;
+    const FRotator Rot = Root ? Root->GetComponentRotation() : FRotator::ZeroRotator;
+
+    // Spawn pawn at the exact migrated position
+    const FTransform SpawnTransform(Rot, Pos);
+    APawn* NewPawn = SpawnDefaultPawnAtTransform(PC, SpawnTransform);
+    if (NewPawn)
+    {
+        PC->Possess(NewPawn);
+    }
+}
+```
+
+### Avoiding ping-pong
+
+When the pawn spawns on the receiving server, it appears right at (or very close to) the zone boundary. Without a grace period, the next boundary check could immediately migrate the player back. Use a transfer arrival timestamp to suppress migration for a short window:
+
+```cpp
+// On arrival:
+TransferArrivalTimes.Add(PC, GetWorld()->GetTimeSeconds());
+
+// In boundary check:
+if (const double* ArrivalTime = TransferArrivalTimes.Find(PC))
+{
+    if (CurrentTime - *ArrivalTime < GracePeriodSeconds)
+        continue; // Skip this PC during grace period
 }
 ```
 
@@ -740,9 +820,15 @@ The DSTM beacon mesh has not finished connecting to the target server. Ensure:
 - `AreAllPeersConnected()` returns `true` before initiating the first migration
 - Firewall rules allow traffic on the DSTM beacon port
 
-### Double-transfer: PlayerController and Pawn both passed separately
+### Ghost pawn / infinite ping-pong after migration
 
-`TransferObjectOwnershipToRemoteServer()` serializes the passed actor **and all its subobjects**, including the possessed `Pawn`. Passing the `Pawn` to `TransferActorToServer()` in addition to the `PlayerController` causes two migration payloads and results in undefined behavior on the destination server. Pass only the `PlayerController`.
+The Pawn is **not** a subobject of the PlayerController — it is a separate actor. `TransferActorToServer(PC)` does not include it. You must:
+1. Destroy the pawn on the sending server before or after `TransferActorToServer()`
+2. Spawn a new pawn on the receiving server
+
+See [Pawn Handling During Migration](#pawn-handling-during-migration).
+
+If the pawn is not destroyed on the source server, it remains visible as a frozen "ghost" with its last animation pose. Worse, if your boundary-check logic reads the ghost pawn's position, it will trigger an infinite migration loop (ping-pong) because the ghost drifts due to simulated movement.
 
 ### `Failed to deserialize FRemoteObjectData` on receive
 
@@ -786,59 +872,87 @@ The proxy logs this warning when a backend game server disconnects or crashes wh
 
 ---
 
-## Known Issues
+## Known Issues & Required Engine Patches
 
-These are engine-level bugs in UE 5.7's DSTM framework that affect cross-server player migration. The migration data itself serializes and transfers correctly via the plugin, but the engine crashes when processing migrated remote objects after the transfer completes.
+The DSTM migration pipeline has been **tested and verified working** with the engine source patches documented below. Without these patches, the engine crashes when processing migrated remote objects. The migration data itself serializes and transfers correctly via the plugin.
 
-### Source server crash: `GTransferQueue.ActiveRequest` assertion during `ServerReplicateActors`
+> **AutoRTFM context:** UE 5.7's DSTM framework relies heavily on AutoRTFM transactional memory. AutoRTFM requires Epic's proprietary `verse-clang` compiler, which is not available for MSVC builds. With MSVC, `AutoRTFM::IsClosed()` always returns `false` and `Transact()` is a no-op. The patches below guard all AutoRTFM-dependent code paths so they degrade gracefully instead of crashing.
 
-**Symptom:** After a player crosses a zone boundary and the DSTM transfer is initiated, the source server crashes with:
+### Patch 1: `RemoteObjectTransfer.cpp` — Null `ActiveRequest` guard
 
-```
-Assertion failed: GTransferQueue.ActiveRequest
-"Attempting to access remote object <ObjectId> but we are outside of a transaction"
-[RemoteObjectTransfer.cpp]
-```
+**File:** `Engine/Source/Runtime/CoreUObject/Private/UObject/RemoteObjectTransfer.cpp`
 
-**Callstack:**
-```
-ServerReplicateActors()
-  └─ GatherActorListsForConnection()
-       └─ UReplicationGraphNode_AlwaysRelevant_ForConnection::AddCachedRelevantActor()
-            └─ FWeakObjectPtr::TryResolveRemoteObject()
-                 └─ UE::RemoteObject::Transfer::MigrateObjectFromRemoteServer()
-                      └─ ResolveObject()
-```
+**Symptom:** Source server crashes with `GTransferQueue.ActiveRequest` assertion during `ServerReplicateActors` after a migration.
 
-**Root cause:** After the source server sends the migration payload, the player's actor is removed from the world but a `FWeakObjectPtr` to the migrated actor remains in the ReplicationGraph's always-relevant node cache. On the next `ServerReplicateActors()` tick, the replication graph tries to resolve this weak pointer, which triggers `TryResolveRemoteObject()`. This calls into the DSTM transfer pipeline, but there is no active transaction context — `GTransferQueue.ActiveRequest` is `nullptr` because the engine only creates transaction contexts during explicit `TransferObjectOwnership` calls, not during replication graph traversal.
+**Fix:** In `ResolveObject()`, return gracefully when `GTransferQueue.ActiveRequest` is `nullptr` instead of asserting:
 
-**Status:** Engine bug. The replication graph needs to be notified when an actor is migrated so it can purge stale weak pointers from its caches before the next replication tick.
-
-### Destination server crash: `AutoRTFM::IsClosed()` assertion during `TickActor`
-
-**Symptom:** After the destination server receives DSTM migration data and feeds it to the engine's receive pipeline, the server crashes with:
-
-```
-Assertion failed: AutoRTFM::IsClosed()
-[RemoteExecutor.cpp]
+```cpp
+if (!GTransferQueue.ActiveRequest)
+{
+    // Outside of a DSTM transaction — stale FWeakObjectPtr reference.
+    // Return the object as-is without attempting remote migration.
+    return;
+}
 ```
 
-**Callstack:**
+### Patch 2: `RemoteObject.cpp` — AutoRTFM guard before `MigrateObjectFromRemoteServer`
+
+**File:** `Engine/Source/Runtime/CoreUObject/Private/UObject/RemoteObject.cpp`
+
+**Fix:** Guard `TryResolveRemoteObject()` to skip migration when AutoRTFM is not in a closed transaction:
+
+```cpp
+if (!AutoRTFM::IsClosed())
+{
+    return nullptr; // Cannot migrate outside closed transaction (MSVC)
+}
 ```
-FTickFunctionTask::DoTask()
-  └─ APlayerController::TickActor()
-       └─ ResolveObjectHandleNoRead()
-            └─ ResolveObject()
-                 └─ UE::RemoteObject::Transfer::MigrateObjectFromRemoteServer()
-```
 
-**Root cause:** The migrated `APlayerController` contains `FObjectHandle` references that were serialized with remote object IDs from the source server. When the destination server ticks the just-received PlayerController, these handles attempt lazy resolution via `ResolveObjectHandleNoRead()`, which triggers `MigrateObjectFromRemoteServer()`. This path requires an active AutoRTFM closed transaction context (`AutoRTFM::IsClosed()` must return `true`), but actor ticking runs in the open transaction context. The engine's DSTM receive pipeline does not wrap post-migration actor ticking in a closed transaction.
+### Patch 3: `RemoteExecutor.cpp` — `AbortTransactionRequiresDependencies` guard
 
-**Status:** Engine bug. The DSTM receive pipeline needs to ensure that all object handle references in the migrated actor are fully resolved within the closed transaction context before the actor begins ticking in the open world.
+**File:** `Engine/Source/Runtime/CoreUObject/Private/UObject/RemoteExecutor.cpp`
 
-### Both crashes occur simultaneously
+**Fix:** Return gracefully from `AbortTransactionRequiresDependencies()` when AutoRTFM is unavailable.
 
-Because the source server initiates migration and the destination receives it on the same frame (or within 1–2 frames), both crashes typically occur together — the source crashes during its next `ServerReplicateActors()` and the destination crashes during its first `TickActor()` of the migrated PlayerController.
+### Patch 4: `DataReplication.cpp` — `ensureMsgf` downgrade
+
+**File:** `Engine/Source/Runtime/Engine/Private/DataReplication.cpp`
+
+**Symptom:** `ensureMsgf(false, "ExecutePendingTransactionalRPCs ...")` fires as a fatal assertion in Debug/Development builds.
+
+**Fix:** Replace the `ensureMsgf` with a one-time `UE_LOG(Warning)` so the server logs the condition but does not crash.
+
+### Patch 5: `PlayerController.cpp` — Null `PlayerCameraManager` guard
+
+**File:** `Engine/Source/Runtime/Engine/Private/PlayerController.cpp`
+
+**Symptom:** Migrated PC ticks with a null `PlayerCameraManager` reference.
+
+**Fix:** Add `IsValid(PlayerCameraManager)` guard before accessing it.
+
+### Patch 6: `PlayerCameraManager.cpp` — Null `this` guard in `GetViewTargetPawn`
+
+**File:** `Engine/Source/Runtime/Engine/Private/PlayerCameraManager.cpp`
+
+**Fix:** Guard `GetViewTargetPawn()` against being called on a null or pending-kill instance.
+
+### Patches already documented above
+
+- **`TrackInstancePropertyBindings.h`** — `FVolatilePropertyStep` size assertion (see [Engine Build Requirement](#engine-build-requirement))
+- **`SceneQuery.cpp`** — unreachable code fix (see [Engine Build Requirement](#engine-build-requirement))
+
+### Summary of all required engine patches
+
+| File | Patch | Purpose |
+|------|-------|---------|
+| `TrackInstancePropertyBindings.h` | Size assert conditional | `FWeakObjectPtr` grows from 8→16 bytes |
+| `SceneQuery.cpp` | Unreachable code fix | MSVC C4702 with warnings-as-errors |
+| `RemoteObjectTransfer.cpp` | Null `ActiveRequest` guard | Prevents crash on stale weak pointers post-migration |
+| `RemoteObject.cpp` | AutoRTFM closed check | Skips migration when not in closed transaction |
+| `RemoteExecutor.cpp` | AutoRTFM availability guard | Graceful return without verse-clang |
+| `DataReplication.cpp` | `ensureMsgf` → warning log | Non-fatal logging for transactional RPC edge case |
+| `PlayerController.cpp` | Null camera manager guard | Migrated PC may tick before camera is ready |
+| `PlayerCameraManager.cpp` | Null `this` guard | Prevents crash on destroyed camera manager |
 
 ---
 

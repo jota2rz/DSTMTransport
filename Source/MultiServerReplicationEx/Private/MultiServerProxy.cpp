@@ -745,9 +745,13 @@ void UProxyNetDriver::UnregisterGameServer(int32 GameServerIndex)
 	// 2. Remove players added for this server
 	for (TObjectPtr<ULocalPlayer>& Player : State.Players)
 	{
-		if (Player)
+		if (Player && GetWorld() && GetWorld()->GetGameInstance())
 		{
-			GetWorld()->GetGameInstance()->RemoveLocalPlayer(Player);
+			UGameInstance* GI = GetWorld()->GetGameInstance();
+			if (GI->GetLocalPlayers().Contains(Player))
+			{
+				GI->RemoveLocalPlayer(Player);
+			}
 		}
 	}
 
