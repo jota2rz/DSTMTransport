@@ -25,6 +25,8 @@ This plugin combines two concerns into a single module:
 - [GUID Seed (Not Needed with DSTM)](#guid-seed-not-needed-with-dstm)
 - [Runtime Scaling](#runtime-scaling)
 - [Dynamic Proxy](#dynamic-proxy)
+- [Dynamic Proxy Registration (Beacon)](#dynamic-proxy-registration-beacon)
+- [Tip: Seamless Transfer with a Custom CMC](#tip-seamless-transfer-with-a-custom-cmc)
 - [Logging](#logging)
 - [Troubleshooting](#troubleshooting)
 - [Known Issues & Required Engine Patches](#known-issues--required-engine-patches)
@@ -44,6 +46,8 @@ The plugin consists of these cooperating classes:
 | `UDSTMSubsystem` | Runtime: manages the DSTM beacon mesh, routes outgoing and incoming migration data, handles pull-requests |
 | `ADSTMBeaconClient` | Network: extends `AMultiServerBeaconClient` with reliable RPCs that carry serialized `FRemoteObjectData` |
 | `UProxyNetDriver` | Proxy: routes clients to multiple game servers (extended with dynamic add/remove/crash detection) |
+| `AProxyRegistrationBeaconClient` | Beacon client: game servers use this to register with the proxy at runtime |
+| `AProxyRegistrationBeaconHostObject` | Beacon host object: runs on the proxy, accepts game server registrations |
 
 ---
 
@@ -113,6 +117,16 @@ ProxyNetDriver->OnGameServerDisconnected.AddLambda(
 ### Integrated DSTM transport
 
 The DSTM transport classes (`UDSTMSubsystem`, `ADSTMBeaconClient`) and the module startup code (server identity initialization, transport delegate binding) are built into the `MultiServerReplicationEx` module. No separate plugin is needed.
+
+### Proxy Fix 4: Dynamic game server registration via beacon
+
+```cpp
+// UProxyNetDriver (public)
+void StartRegistrationBeacon(int32 Port);
+void StopRegistrationBeacon();
+```
+
+Game servers can register with the proxy at runtime by connecting to a registration beacon instead of being listed statically in `-ProxyGameServers=`. The beacon uses `AProxyRegistrationBeaconClient` (game server side) and `AProxyRegistrationBeaconHostObject` (proxy side). The game server passes its listen address via `GetLoginOptions()`, and the proxy extracts it from the login URL and calls `RegisterGameServerAndConnectClients()`. See [Dynamic Proxy Registration (Beacon)](#dynamic-proxy-registration-beacon).
 
 ---
 
@@ -341,16 +355,19 @@ These arguments are parsed by `UMultiServerNode::ParseCommandLineIntoCreateParam
 | `-MultiServerPeers=<ip:port,...>` | Yes (multi-server) | Comma-separated list of `host:port` pairs pointing to other servers' engine mesh beacon ports. |
 | `-MultiServerNumServers=<int>` | No | Expected number of servers for `AreAllServersConnected()`. Defaults to the peer count if omitted. Rarely needed — the peer list length is usually sufficient. |
 
-### Proxy arguments (stock)
+### Proxy arguments (stock + extended)
 
-These arguments are parsed by `UProxyNetDriver::InitBase()` and configure the proxy server that multiplexes player connections to backend game servers:
+These arguments configure the proxy server that multiplexes player connections to backend game servers:
 
 | Argument | Required | Description |
 |----------|----------|-------------|
-| `-ProxyGameServers=<addresses>` | Yes (proxy only) | Comma-separated list of backend game server addresses. Supports port ranges (`127.0.0.1:7777-7778` expands to two entries). |
+| `-ProxyGameServers=<addresses>` | No (proxy only) | Comma-separated list of backend game server addresses for **static** registration at startup. Supports port ranges (`127.0.0.1:7777-7778` expands to two entries). Not needed when using dynamic beacon registration. |
+| `-ProxyRegistrationPort=<int>` | No (proxy only) | Port for the **dynamic** registration beacon listener. Game servers connect to this beacon at runtime and register themselves automatically. See [Dynamic Proxy Registration (Beacon)](#dynamic-proxy-registration-beacon). |
 | `-NetDriverOverrides=<class>` | Yes (proxy only) | Must be set to `/Script/MultiServerReplicationEx.ProxyNetDriver` to activate the proxy. |
 | `ProxyClientPrimaryGameServer=<int\|random>` | No | Which game server index is the primary for each new client. Pass `random` for randomization. Defaults to `0`. |
 | `-ProxyCyclePrimaryGameServer` | No | Flag: after each client connects, advance `PrimaryGameServerForNextClient` to the next server (round-robin). |
+
+> **Note:** `-ProxyGameServers=` and `-ProxyRegistrationPort=` can be used together. Static servers are registered immediately at startup; additional servers can join later via the beacon. If neither is provided, the proxy starts with zero game servers and waits for beacon registrations.
 
 ### Example (two-server cluster with proxy)
 
@@ -371,11 +388,17 @@ A complete local launch requires three kinds of arguments per game server:
 -MultiServerListenPort=15001 -MultiServerPeers=127.0.0.1:15000
 -DedicatedServerId=server-2 -DSTMListenPort=16001 -DSTMPeers=127.0.0.1:16000
 
-# Proxy (connects clients to both game servers)
+# Proxy — OPTION A: static registration (servers known at launch)
 -server -port=7780 -DisableGarbageElimination
 -DedicatedServerId=proxy-1
 -NetDriverOverrides=/Script/MultiServerReplicationEx.ProxyNetDriver
 -ProxyGameServers=127.0.0.1:7777,127.0.0.1:7778
+
+# Proxy — OPTION B: dynamic registration (servers register via beacon)
+-server -port=7780 -DisableGarbageElimination
+-DedicatedServerId=proxy-1
+-NetDriverOverrides=/Script/MultiServerReplicationEx.ProxyNetDriver
+-ProxyRegistrationPort=17000
 ```
 
 | Port | Purpose |
@@ -384,6 +407,7 @@ A complete local launch requires three kinds of arguments per game server:
 | 15000–15001 | Engine multi-server mesh (server ↔ server beacons for replication) |
 | 16000–16001 | DSTM beacon mesh (server ↔ server beacons for migration transport) |
 | 7780 | Proxy listener (client ↔ proxy, UDP) |
+| 17000 | Proxy registration beacon (game server → proxy, TCP) — only when using `-ProxyRegistrationPort=` |
 
 The proxy does **not** need DSTM mesh arguments (`-DSTMListenPort`, `-DSTMPeers`) — it forwards client traffic to game servers but does not participate in server-to-server migration. However, it **does** need `-DedicatedServerId=` and `-DisableGarbageElimination` because the global server identity must be initialized before the engine touches any remote object types.
 
@@ -783,6 +807,241 @@ The automation of scaling decisions is **out of scope** for this plugin. An exte
 
 ---
 
+## Dynamic Proxy Registration (Beacon)
+
+Instead of listing game servers statically with `-ProxyGameServers=`, the proxy can accept dynamic registrations over a beacon. Game servers connect to the proxy's registration beacon and announce their listen address. The proxy then calls `RegisterGameServerAndConnectClients()` — the same code path as static registration — so existing clients get routes to the new server immediately.
+
+### Proxy side
+
+Start the registration beacon listener by passing `-ProxyRegistrationPort=<port>` on the proxy's command line. Your game code must parse this argument and call `StartRegistrationBeacon()` on the proxy net driver:
+
+```cpp
+// YourGameMode.cpp — called from StartPlay() or equivalent
+UProxyNetDriver* ProxyDriver = Cast<UProxyNetDriver>(GetWorld()->GetNetDriver());
+if (ProxyDriver)
+{
+    int32 RegistrationPort = 0;
+    if (FParse::Value(FCommandLine::Get(), TEXT("-ProxyRegistrationPort="), RegistrationPort))
+    {
+        ProxyDriver->StartRegistrationBeacon(RegistrationPort);
+    }
+}
+```
+
+`StartRegistrationBeacon()` spawns an `AProxyRegistrationBeaconHost` (which enables the NMT_Login handshake so the login URL is populated) and an `AProxyRegistrationBeaconHostObject` that extracts the game server address from the login options.
+
+The beacon is automatically stopped during `UProxyNetDriver::Shutdown()`.
+
+### Game server side
+
+Each game server connects to the proxy's registration beacon and passes its own listen address:
+
+```cpp
+// YourGameMode.cpp — called from StartPlay() when not running as proxy
+
+// Determine this server's listen address
+FString GameServerAddress = FString::Printf(TEXT("127.0.0.1:%d"), GetWorld()->URL.Port);
+
+// Parse the proxy beacon address from command line
+// (your game code decides how to pass this — could be a custom arg or config)
+FString ProxyBeaconAddress; // e.g. "127.0.0.1:17000"
+
+AProxyRegistrationBeaconClient* BeaconClient =
+    GetWorld()->SpawnActor<AProxyRegistrationBeaconClient>();
+if (BeaconClient)
+{
+    BeaconClient->SetGameServerAddress(GameServerAddress);
+
+    FURL BeaconURL(nullptr, *ProxyBeaconAddress, ETravelType::TRAVEL_Absolute);
+    BeaconClient->InitClient(BeaconURL);
+}
+```
+
+The beacon client's `GetLoginOptions()` appends `?GameServerAddress=<host:port>` to the login URL. On the proxy side, `AProxyRegistrationBeaconHostObject::OnClientConnected()` extracts this from `Connection->RequestURL` and calls `HandleGameServerRegistration()`.
+
+### How it works
+
+1. Game server spawns `AProxyRegistrationBeaconClient`, sets its listen address, connects to proxy beacon
+2. Beacon handshake completes (NMT_Login with `bAuthRequired=true`, auto-approved)
+3. `OnClientConnected()` fires on the proxy — extracts `GameServerAddress` from the login URL
+4. `HandleGameServerRegistration()` looks up `UProxyNetDriver` and calls `RegisterGameServerAndConnectClients()`
+5. All existing proxy clients get routes to the new server; future clients get them on `NMT_Join`
+
+### Combining static and dynamic registration
+
+You can use both modes together:
+- `-ProxyGameServers=127.0.0.1:7777` — server-1 is registered at startup
+- `-ProxyRegistrationPort=17000` — server-2, server-3, etc. register later via beacon
+
+This is useful when some servers are always present (static) and others scale dynamically.
+
+---
+
+## Tip: Seamless Transfer with a Custom CMC
+
+DSTM migration transfers the PlayerController and spawns a new pawn on the destination server. During the transit gap (the time between the source server serializing the actor and the destination server processing the first client moves), the client keeps predicting movement locally. This causes two problems on the destination server:
+
+1. **Height displacement** — If the pawn returns to a server it previously lived on, the engine reuses the zombie actor whose `CharacterMovementComponent` still holds stale `ServerPredictionData`. The stale timestamps cause `ForcePositionUpdate` to compute a huge `DeltaTime` (`world_time - old_timestamp`), triggering max-iteration warnings and displacing the character vertically.
+
+2. **Position jitter** — The first client moves to arrive carry positions that have drifted from the serialized spawn point by `speed × transit_time`. The default position error threshold (~1.73 UU from `MAXPOSITIONERRORSQUARED = 3.0`) rejects these as errors, triggering a server correction that snaps the client back — visible as a jitter/rubber-band.
+
+Both problems can be solved with a custom `UCharacterMovementComponent` subclass that resets stale state on arrival and temporarily widens the position error tolerance.
+
+### Example: Custom CMC for seamless DSTM transfer
+
+```cpp
+// YourCharacterMovementComponent.h
+
+UCLASS()
+class UYourCharacterMovementComponent : public UCharacterMovementComponent
+{
+    GENERATED_BODY()
+
+public:
+    /**
+     * Call this from your GameMode's migrated-player-arrival handler,
+     * after the pawn is possessed but before the first tick processes client moves.
+     */
+    void ResetForDSTMArrival();
+
+protected:
+    virtual bool ServerExceedsAllowablePositionError(
+        float ClientTimeStamp, float DeltaTime, const FVector& Accel,
+        const FVector& ClientWorldLocation, const FVector& RelativeClientLocation,
+        UPrimitiveComponent* ClientMovementBase, FName ClientBaseBoneName,
+        uint8 ClientMovementMode) override;
+
+private:
+    /** World time when the most recent DSTM arrival was processed. 0 = no active grace. */
+    float DSTMArrivalWorldTime = 0.f;
+
+    /** Speed at the moment of DSTM arrival (for tolerance calculation). */
+    float DSTMArrivalSpeed = 0.f;
+
+    /** How long (seconds) the grace window lasts after DSTM arrival. */
+    static constexpr float DSTMGraceDuration = 5.0f;
+
+    /** Max expected DSTM transit time (seconds). Tolerance decays from this to zero. */
+    static constexpr float DSTMTransitAllowance = 0.5f;
+
+    /** Fixed safety margin (UU) always added to the speed-based tolerance. */
+    static constexpr float DSTMSafetyMargin = 50.f;
+};
+```
+
+```cpp
+// YourCharacterMovementComponent.cpp
+
+void UYourCharacterMovementComponent::ResetForDSTMArrival()
+{
+    // Fix 1: Reset stale ServerPredictionData from the zombie pawn's previous
+    // lifecycle on this server. Without this, ForcePositionUpdate computes a
+    // huge DeltaTime and displaces the character vertically.
+    if (HasPredictionData_Server())
+    {
+        FNetworkPredictionData_Server_Character* ServerData = GetPredictionData_Server_Character();
+        ServerData->ServerTimeStamp = 0.f;
+        ServerData->CurrentClientTimeStamp = 0.f;
+        ServerData->ServerAccumulatedClientTimeStamp = 0.0;
+        ServerData->ResetForcedUpdateState();
+    }
+
+    // Fix 2: Start a position-tolerance grace window. The tolerance starts
+    // high to absorb the transit drift and decays back to just the margin.
+    if (const UWorld* World = GetWorld())
+    {
+        DSTMArrivalWorldTime = World->GetTimeSeconds();
+        DSTMArrivalSpeed = Velocity.Size();
+    }
+}
+
+bool UYourCharacterMovementComponent::ServerExceedsAllowablePositionError(
+    float ClientTimeStamp, float DeltaTime, const FVector& Accel,
+    const FVector& ClientWorldLocation, const FVector& RelativeClientLocation,
+    UPrimitiveComponent* ClientMovementBase, FName ClientBaseBoneName,
+    uint8 ClientMovementMode)
+{
+    if (DSTMArrivalWorldTime > 0.f)
+    {
+        const UWorld* World = GetWorld();
+        const float TimeSinceArrival = World
+            ? (World->GetTimeSeconds() - DSTMArrivalWorldTime)
+            : DSTMGraceDuration;
+
+        if (TimeSinceArrival < DSTMGraceDuration)
+        {
+            const FVector ServerLoc = UpdatedComponent->GetComponentLocation();
+            const float ErrorSq = (ServerLoc - ClientWorldLocation).SizeSquared();
+
+            // Tolerance decays linearly: high at arrival, down to just the
+            // safety margin after TransitAllowance seconds.
+            const float TransitRemaining = FMath::Max(DSTMTransitAllowance - TimeSinceArrival, 0.f);
+            const float Tolerance = DSTMArrivalSpeed * TransitRemaining + DSTMSafetyMargin;
+
+            if (ErrorSq <= FMath::Square(Tolerance))
+            {
+                // Trust the client — snap server pawn to client position.
+                UpdatedComponent->MoveComponent(
+                    ClientWorldLocation - ServerLoc,
+                    UpdatedComponent->GetComponentQuat(),
+                    true, nullptr, EMoveComponentFlags::MOVECOMP_NoFlags,
+                    ETeleportType::TeleportPhysics);
+                bJustTeleported = true;
+                return false; // no correction
+            }
+
+            // Beyond tolerance — end grace, fall through to default correction.
+            DSTMArrivalWorldTime = 0.f;
+        }
+        else
+        {
+            DSTMArrivalWorldTime = 0.f; // grace expired
+        }
+    }
+
+    return Super::ServerExceedsAllowablePositionError(
+        ClientTimeStamp, DeltaTime, Accel, ClientWorldLocation,
+        RelativeClientLocation, ClientMovementBase, ClientBaseBoneName,
+        ClientMovementMode);
+}
+```
+
+### Calling `ResetForDSTMArrival()`
+
+In your game mode's migrated-player-arrival handler, after possessing the new pawn:
+
+```cpp
+void AYourGameMode::HandleMigratedPlayerArrival(APlayerController* PC)
+{
+    // ... spawn pawn, possess, etc.
+
+    if (APawn* NewPawn = PC->GetPawn())
+    {
+        if (auto* CMC = Cast<UYourCharacterMovementComponent>(
+                NewPawn->FindComponentByClass<UCharacterMovementComponent>()))
+        {
+            CMC->ResetForDSTMArrival();
+        }
+    }
+}
+```
+
+### Tuning the constants
+
+| Constant | Default | Purpose |
+|----------|---------|---------|
+| `DSTMGraceDuration` | `5.0` s | Total duration of the grace window. During this time, server snaps to client position when within tolerance. |
+| `DSTMTransitAllowance` | `0.5` s | Max expected transit time. Tolerance decays from `speed × 0.5 + margin` down to just `margin` over this period. Increase if your migration takes longer (high latency, large payloads). |
+| `DSTMSafetyMargin` | `50.0` UU | Fixed tolerance added on top of the speed-based component. Covers any residual position error after the transit drift has been absorbed. |
+
+At `MaxWalkSpeed = 600` UU/s with the defaults above:
+- **At t=0** (first frame after arrival): tolerance = `600 × 0.5 + 50 = 350` UU
+- **At t=0.5s**: tolerance = `600 × 0 + 50 = 50` UU
+- **At t=0.5–5.0s**: tolerance stays at `50` UU (server still snaps to client)
+- **After 5.0s**: normal threshold resumes (~1.73 UU)
+
+---
+
 ## Logging
 
 | Log category | Used in |
@@ -790,6 +1049,9 @@ The automation of scaling decisions is **out of scope** for this plugin. An exte
 | `LogDSTM` | `FMultiServerReplicationExModule` — module startup, delegate binding, server identity |
 | `LogDSTMSub` | `UDSTMSubsystem` — mesh lifecycle, peer connections, migration send/receive |
 | `LogDSTMBeacon` | `ADSTMBeaconClient` — beacon RPC send/receive |
+| `LogNetProxy` | `UProxyNetDriver` — proxy lifecycle, game server registration, route management |
+| `LogProxyRegistrationHost` | `AProxyRegistrationBeaconHostObject` — beacon host, dynamic game server registration |
+| `LogProxyRegistrationClient` | `AProxyRegistrationBeaconClient` — beacon client, connection to proxy |
 
 Enable verbose output:
 
@@ -799,6 +1061,9 @@ Enable verbose output:
 LogDSTM=Verbose
 LogDSTMSub=Verbose
 LogDSTMBeacon=Verbose
+LogNetProxy=Verbose
+LogProxyRegistrationHost=Verbose
+LogProxyRegistrationClient=Verbose
 ```
 
 ---

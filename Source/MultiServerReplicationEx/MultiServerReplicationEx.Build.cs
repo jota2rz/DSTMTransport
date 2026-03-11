@@ -21,6 +21,7 @@ public class MultiServerReplicationEx : ModuleRules
 
         PublicDependencyModuleNames.AddRange(
             new string[] {
+				"OnlineSubsystem",
 				"OnlineSubsystemUtils"
 			}
 		);

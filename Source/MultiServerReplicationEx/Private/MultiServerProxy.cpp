@@ -1,6 +1,8 @@
 // Copyright Epic Games, Inc. All Rights Reserved.
 
 #include "MultiServerProxy.h"
+#include "ProxyRegistrationBeaconHostObject.h"
+#include "OnlineBeaconHost.h"
 #include "UnrealEngine.h"
 #include "Engine/LocalPlayer.h"
 #include "Engine/GameInstance.h"
@@ -1130,6 +1132,8 @@ bool UProxyNetDriver::CanDowngradeActorRole(UNetConnection* ProxyConnection, AAc
 
 void UProxyNetDriver::Shutdown()
 {
+	StopRegistrationBeacon();
+
 	Super::Shutdown();
 
 	for (FGameServerConnectionState& ConnectionState : GameServerConnections)
@@ -1139,6 +1143,62 @@ void UProxyNetDriver::Shutdown()
 	}
 
 	GameServerConnections.Reset();
+}
+
+void UProxyNetDriver::StartRegistrationBeacon(int32 Port)
+{
+	UWorld* BeaconWorld = GetWorld();
+	if (!BeaconWorld)
+	{
+		UE_LOG(LogNetProxy, Error, TEXT("StartRegistrationBeacon: no world"));
+		return;
+	}
+
+	RegistrationBeaconHost = BeaconWorld->SpawnActor<AProxyRegistrationBeaconHost>();
+	if (!RegistrationBeaconHost)
+	{
+		UE_LOG(LogNetProxy, Error, TEXT("StartRegistrationBeacon: failed to spawn beacon host"));
+		return;
+	}
+
+	RegistrationBeaconHost->ListenPort = Port;
+
+	if (!RegistrationBeaconHost->InitHost())
+	{
+		UE_LOG(LogNetProxy, Error, TEXT("StartRegistrationBeacon: InitHost failed on port %d"), Port);
+		RegistrationBeaconHost->Destroy();
+		RegistrationBeaconHost = nullptr;
+		return;
+	}
+
+	RegistrationHostObject = BeaconWorld->SpawnActor<AProxyRegistrationBeaconHostObject>();
+	if (!RegistrationHostObject)
+	{
+		UE_LOG(LogNetProxy, Error, TEXT("StartRegistrationBeacon: failed to spawn host object"));
+		RegistrationBeaconHost->DestroyBeacon();
+		RegistrationBeaconHost = nullptr;
+		return;
+	}
+
+	RegistrationBeaconHost->RegisterHost(RegistrationHostObject);
+	RegistrationBeaconHost->PauseBeaconRequests(false);
+
+	UE_LOG(LogNetProxy, Log, TEXT("Registration beacon started on port %d"), Port);
+}
+
+void UProxyNetDriver::StopRegistrationBeacon()
+{
+	if (RegistrationHostObject)
+	{
+		RegistrationHostObject->Destroy();
+		RegistrationHostObject = nullptr;
+	}
+
+	if (RegistrationBeaconHost)
+	{
+		RegistrationBeaconHost->DestroyBeacon();
+		RegistrationBeaconHost = nullptr;
+	}
 }
 
 void UProxyNetDriver::TickFlush(float DeltaSeconds)

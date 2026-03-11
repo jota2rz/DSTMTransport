@@ -10,6 +10,9 @@
 #include "IpConnection.h"
 #include "MultiServerProxy.generated.h"
 
+class AOnlineBeaconHost;
+class AProxyRegistrationBeaconHostObject;
+
 /** Broadcast when a backend game server connection is lost (index, URL). */
 DECLARE_MULTICAST_DELEGATE_TwoParams(FOnGameServerDisconnected, int32 /*GameServerIndex*/, const FURL& /*GameServerURL*/);
 
@@ -339,6 +342,12 @@ public:
 	/** Unregister a game server, closing all routes and destroying the backend driver. */
 	void UnregisterGameServer(int32 GameServerIndex);
 
+	/** Start a beacon host that listens for dynamic game server registrations. */
+	void StartRegistrationBeacon(int32 Port);
+
+	/** Stop the registration beacon and clean up. */
+	void StopRegistrationBeacon();
+
 	/** Broadcast when a backend game server connection is lost. */
 	FOnGameServerDisconnected OnGameServerDisconnected;
 
@@ -499,6 +508,13 @@ private:
 
 	// As a client connects to the proxy, randomize PrimaryGameServerForNextClient to one of the known game servers.
 	bool bRandomizePrimaryGameServerForNextClient = false;
+
+	/** Beacon host for dynamic game server registration (started with -ProxyRegistrationPort=). */
+	UPROPERTY()
+	TObjectPtr<AOnlineBeaconHost> RegistrationBeaconHost;
+
+	UPROPERTY()
+	TObjectPtr<AProxyRegistrationBeaconHostObject> RegistrationHostObject;
 };
 
 /** 
